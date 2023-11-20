@@ -433,7 +433,7 @@ pub mod data_source_tests {
         leaf.set_height(1);
 
         qc.leaf_commitment = leaf.commit();
-        let block = BlockQueryData::new::<MockNodeImpl>(leaf.clone(), qc.clone(), block).unwrap();
+        let block = BlockQueryData::new::<MockNodeImpl>(&leaf, &qc, block).unwrap();
         let leaf = LeafQueryData::new(leaf, qc).unwrap();
 
         // Insert, but do not commit, some data and check that we can read it back.

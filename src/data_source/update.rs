@@ -103,8 +103,7 @@ where
                 .await?;
                 // For the same reason, this will not panic either.
                 self.insert_block(
-                    BlockQueryData::new::<I>(leaf.clone(), qc.clone(), block)
-                        .expect("inconsistent block"),
+                    BlockQueryData::new::<I>(leaf, &qc, block).expect("inconsistent block"),
                 )
                 .await?;
             }

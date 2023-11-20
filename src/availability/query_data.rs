@@ -278,8 +278,8 @@ where
     /// Fails with an [`InconsistentBlockError`] if `qc`, `leaf`, and `block` do not all correspond
     /// to the same block.
     pub fn new<I: NodeImplementation<Types>>(
-        leaf: Leaf<Types, I>,
-        qc: QuorumCertificate<Types, I>,
+        leaf: &Leaf<Types, I>,
+        qc: &QuorumCertificate<Types, I>,
         block: Block<Types>,
     ) -> Result<Self, InconsistentBlockError<Types, I>>
     where
@@ -287,15 +287,21 @@ where
     {
         ensure!(
             qc.leaf_commitment() == leaf.commit(),
-            InconsistentQcSnafu { qc, leaf }
+            InconsistentQcSnafu {
+                qc: qc.clone(),
+                leaf: leaf.clone()
+            }
         );
         ensure!(
             leaf.get_deltas().commitment() == block.commit(),
-            InconsistentBlockSnafu { leaf, block }
+            InconsistentBlockSnafu {
+                leaf: leaf.clone(),
+                block
+            }
         );
         Ok(Self {
             hash: block.commit(),
-            height: leaf_height(&leaf),
+            height: leaf_height(leaf),
             timestamp: round_timestamp(leaf.get_timestamp()),
             size: bincode_opts().serialized_size(&block).unwrap_or_default(),
             block,

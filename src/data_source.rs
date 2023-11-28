@@ -187,7 +187,6 @@ pub mod data_source_tests {
                 .subscribe_blocks(0)
                 .await
                 .unwrap()
-                .map(Result::unwrap)
                 .enumerate()
         };
         for nonce in 0..3 {
@@ -271,7 +270,7 @@ pub mod data_source_tests {
         let mut blocks = { ds.read().await.subscribe_blocks(0).await.unwrap() };
         network.start().await;
         loop {
-            if !blocks.next().await.unwrap().unwrap().is_empty() {
+            if !blocks.next().await.unwrap().is_empty() {
                 break;
             }
         }

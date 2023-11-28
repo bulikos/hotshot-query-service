@@ -19,7 +19,7 @@ use super::{
 use crate::{
     availability::{
         data_source::{
-            AvailabilityDataSource, BlockId, LeafId, ResourceId, UpdateAvailabilityData,
+            AvailabilityDataSource, BlockId, ErrorEvent, LeafId, ResourceId, UpdateAvailabilityData,
         },
         query_data::{
             BlockHash, BlockQueryData, LeafHash, LeafQueryData, QueryableBlock, TransactionHash,
@@ -382,8 +382,9 @@ impl<Types: NodeType, I: NodeImplementation<Types>> AvailabilityDataSource<Types
 where
     Block<Types>: QueryableBlock,
 {
-    type LeafStream = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>;
-    type BlockStream = BoxStream<'static, QueryResult<BlockQueryData<Types>>>;
+    type LeafStream = BoxStream<'static, LeafQueryData<Types, I>>;
+    type BlockStream = BoxStream<'static, BlockQueryData<Types>>;
+    type ErrorStream = stream::Pending<ErrorEvent<Types, I>>;
 
     type LeafRange<'a, R> = BoxStream<'a, QueryResult<LeafQueryData<Types, I>>>
     where
@@ -484,7 +485,6 @@ where
             .leaf_storage
             .subscribe(height)
             .context(MissingSnafu)?
-            .map(Ok)
             .boxed())
     }
 
@@ -493,8 +493,15 @@ where
             .block_storage
             .subscribe(height)
             .context(MissingSnafu)?
-            .map(Ok)
             .boxed())
+    }
+
+    async fn subscribe_errors(&self) -> Self::ErrorStream {
+        // Error recovery is not yet implemented for [`FileSystemDataSource`], since the underlying
+        // [`AppendLog`]-based storage does not support out-of-order insertion of blocks and leaves
+        // retrieved in response to errors. For now, return a stream that never yields any events.
+        // To fix this: https://github.com/EspressoSystems/hotshot-query-service/issues/16.
+        stream::pending()
     }
 }
 

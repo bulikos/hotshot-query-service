@@ -11,9 +11,10 @@
 // see <https://www.gnu.org/licenses/>.
 
 use super::query_data::{
-    BlockQueryData, LeafQueryData, QueryableBlock, TransactionHash, TransactionIndex,
+    BlockHash, BlockQueryData, LeafHash, LeafQueryData, QueryableBlock, TransactionHash,
+    TransactionIndex,
 };
-use crate::{Block, Deltas, Leaf, QueryResult, Resolvable};
+use crate::{Block, Deltas, Leaf, QueryError, QueryResult, Resolvable};
 use async_trait::async_trait;
 use commit::{Commitment, Committable};
 use derivative::Derivative;
@@ -23,6 +24,7 @@ use hotshot_types::traits::{
     node_implementation::{NodeImplementation, NodeType},
     signature_key::EncodedPublicKey,
 };
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt::Debug;
@@ -60,13 +62,62 @@ impl<T: Committable> PartialOrd for ResourceId<T> {
 pub type BlockId<Types> = ResourceId<Block<Types>>;
 pub type LeafId<Types, I> = ResourceId<Leaf<Types, I>>;
 
+/// A notification of an error.
+///
+/// This event is broadcast, via [`AvailabilityDataSource::ErrorStream`], when an error occurs in an
+/// asynchronous task that the data source cannot handle on its own. It includes the original error
+/// that triggered the event as well as any available context about what the data source was trying
+/// to do when it encountered the error, which may help the event handler resolve the problem.
+#[derive(Derivative, Deserialize, Serialize)]
+#[derivative(Clone(bound = ""), Debug(bound = ""))]
+#[serde(bound = "")]
+pub struct ErrorEvent<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+{
+    /// The error which triggered this event.
+    pub error: QueryError,
+
+    /// Additional information about what was happening when the event was triggered.
+    ///
+    /// Some errors are recoverable, but only with additional information that is beyond the scope
+    /// of the data source itself. In such cases, `context` includes any data required to retrieve
+    /// this additional information, and these errors can be resolved by providing the required
+    /// information (such as a block payload which was missing from storage).
+    pub context: Option<ErrorContext<Types, I>>,
+}
+
+/// Information about what was happening when an [`ErrorEvent`] event was triggered.
+#[derive(Derivative, Deserialize, Serialize)]
+#[derivative(Clone(bound = ""), Debug(bound = ""))]
+#[serde(bound = "")]
+pub enum ErrorContext<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+{
+    /// The data source was looking up a block which was not available in its storage.
+    ///
+    /// Fetching the block with the given hash and adding it to storage via
+    /// [`UpdateAvailabilityData::insert_block`] may resolve the problem.
+    MissingBlock(BlockHash<Types>),
+
+    /// The data source was looking up a leaf which was not available in its storage.
+    ///
+    /// Fetching the leaf with the given hash and adding it to storage via
+    /// [`UpdateAvailabilityData::insert_leaf`] may resolve the problem.
+    MissingLeaf(LeafHash<Types, I>),
+}
+
 #[async_trait]
 pub trait AvailabilityDataSource<Types: NodeType, I: NodeImplementation<Types>>
 where
     Block<Types>: QueryableBlock,
 {
-    type LeafStream: Stream<Item = QueryResult<LeafQueryData<Types, I>>> + Unpin + Send;
-    type BlockStream: Stream<Item = QueryResult<BlockQueryData<Types>>> + Unpin + Send;
+    type LeafStream: Stream<Item = LeafQueryData<Types, I>> + Unpin + Send;
+    type BlockStream: Stream<Item = BlockQueryData<Types>> + Unpin + Send;
+    type ErrorStream: Stream<Item = ErrorEvent<Types, I>> + Unpin + Send;
 
     type LeafRange<'a, R>: 'a + Stream<Item = QueryResult<LeafQueryData<Types, I>>> + Unpin
     where
@@ -107,6 +158,20 @@ where
 
     async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream>;
     async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream>;
+
+    /// Get notifications when errors occur in the data source.
+    ///
+    /// A data source frequently spawns long-running background tasks, such as connections to remote
+    /// services and long-running streams to clients. Since these tasks run in the background, it is
+    /// generally undesirable for the entire task to fail, and even if it were, there is no caller
+    /// for it to return an error to. Instead, callers can be notified indirectly of errors that
+    /// occur in such tasks by subscribing to this stream.
+    ///
+    /// This can be useful for, for example, a GUI application which needs to display a popup
+    /// notification to alert the user when something unusual occurs. Or, additional components can
+    /// be attached via this stream to attempt to recover from errors, such as by fetching resources
+    /// whose absence triggered an error from another source.
+    async fn subscribe_errors(&self) -> Self::ErrorStream;
 }
 
 #[async_trait]

@@ -15,21 +15,22 @@
 use super::{versioned_channel::VersionedChannel, VersionedDataSource};
 use crate::{
     availability::{
-        AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData, ResourceId,
-        TransactionHash, TransactionIndex, UpdateAvailabilityData,
+        AvailabilityDataSource, BlockId, BlockQueryData, ErrorEvent, LeafId, LeafQueryData,
+        ResourceId, TransactionHash, TransactionIndex, UpdateAvailabilityData,
     },
     metrics::PrometheusMetrics,
     status::StatusDataSource,
     Block, Deltas, Leaf, MissingSnafu, NotFoundSnafu, QueryError, QueryResult, QueryableBlock,
     QuorumCertificate, Resolvable,
 };
+use async_compatibility_layer::async_primitives::broadcast::{self, BroadcastSender};
 use async_std::{net::ToSocketAddrs, task::spawn};
 use async_trait::async_trait;
 use commit::Committable;
 use futures::{
     channel::oneshot,
     future::{select, Either, FutureExt},
-    stream::{BoxStream, StreamExt, TryStreamExt},
+    stream::{self, BoxStream, StreamExt, TryStreamExt},
     task::{Context, Poll},
     AsyncRead, AsyncWrite,
 };
@@ -493,6 +494,7 @@ where
     tx_in_progress: bool,
     leaf_stream: VersionedChannel<LeafQueryData<Types, I>>,
     block_stream: VersionedChannel<BlockQueryData<Types>>,
+    error_stream: BroadcastSender<ErrorEvent<Types, I>>,
     metrics: PrometheusMetrics,
     kill: Option<oneshot::Sender<()>>,
 }
@@ -572,6 +574,7 @@ where
             kill: Some(kill),
             leaf_stream: VersionedChannel::init(),
             block_stream: VersionedChannel::init(),
+            error_stream: broadcast::channel().0,
             metrics: Default::default(),
         })
     }
@@ -671,8 +674,9 @@ where
     I: NodeImplementation<Types>,
     Block<Types>: QueryableBlock,
 {
-    type LeafStream = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>;
-    type BlockStream = BoxStream<'static, QueryResult<BlockQueryData<Types>>>;
+    type LeafStream = BoxStream<'static, LeafQueryData<Types, I>>;
+    type BlockStream = BoxStream<'static, BlockQueryData<Types>>;
+    type ErrorStream = BoxStream<'static, ErrorEvent<Types, I>>;
 
     type LeafRange<'a, R> = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>
     where
@@ -873,18 +877,35 @@ where
 
     async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> {
         // Fetch leaves above `height` which have already been produced.
-        let current_leaves = self.get_leaf_range(height..).await?;
+        let current_leaves: Vec<_> = self.get_leaf_range(height..).await?.try_collect().await?;
         // Subscribe to future leaves after that.
-        let future_leaves = self.leaf_stream.subscribe().await.map(Ok);
-        Ok(current_leaves.chain(future_leaves).boxed())
+        let future_leaves = self.leaf_stream.subscribe().await;
+        Ok(stream::iter(current_leaves).chain(future_leaves).boxed())
     }
 
     async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
         // Fetch blocks above `height` which have already been produced.
-        let current_blocks = self.get_block_range(height..).await?;
+        let current_blocks: Vec<_> = self.get_block_range(height..).await?.try_collect().await?;
         // Subscribe to future blocks after that.
-        let future_blocks = self.block_stream.subscribe().await.map(Ok);
-        Ok(current_blocks.chain(future_blocks).boxed())
+        let future_blocks = self.block_stream.subscribe().await;
+        Ok(stream::iter(current_blocks).chain(future_blocks).boxed())
+    }
+
+    async fn subscribe_errors(&self) -> Self::ErrorStream {
+        stream::unfold(
+            self.error_stream.handle_async().await,
+            |mut handle| async move {
+                match handle.recv_async().await {
+                    Ok(event) => Some((event, handle)),
+                    Err(_) => {
+                        // An error in receive means the send end of the channel has been
+                        // disconnected, which means the stream is over.
+                        None
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 }
 

@@ -287,6 +287,7 @@
 //!
 //!     type LeafStream = D::LeafStream;
 //!     type BlockStream = D::BlockStream;
+//!     type ErrorStream = D::ErrorStream;
 //!
 //!     async fn get_leaf<ID>(&self, id: ID) -> QueryResult<LeafQueryData<AppTypes, AppNodeImpl>>
 //!     where
@@ -310,6 +311,7 @@
 //! #   async fn count_proposals(&self, id: &EncodedPublicKey) -> QueryResult<usize> { todo!() }
 //! #   async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> { todo!() }
 //! #   async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> { todo!() }
+//! #   async fn subscribe_errors(&self) -> Self::ErrorStream { todo!() }
 //! }
 //!
 //! // Implement data source trait for status API by delegating to the underlying data source.
@@ -516,6 +518,8 @@ mod test {
             <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::LeafStream;
         type BlockStream =
             <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::BlockStream;
+        type ErrorStream =
+            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::ErrorStream;
 
         type LeafRange<'a, R> =
             <MockDataSource as AvailabilityDataSource<
@@ -579,6 +583,9 @@ mod test {
         }
         async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
             self.hotshot_qs.subscribe_blocks(height).await
+        }
+        async fn subscribe_errors(&self) -> Self::ErrorStream {
+            self.hotshot_qs.subscribe_errors().await
         }
     }
 

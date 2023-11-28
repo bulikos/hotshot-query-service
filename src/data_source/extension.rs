@@ -140,6 +140,7 @@ where
 {
     type LeafStream = D::LeafStream;
     type BlockStream = D::BlockStream;
+    type ErrorStream = D::ErrorStream;
 
     type LeafRange<'a, R> = D::LeafRange<'a, R>
     where
@@ -195,6 +196,9 @@ where
     }
     async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
         self.data_source.subscribe_blocks(height).await
+    }
+    async fn subscribe_errors(&self) -> Self::ErrorStream {
+        self.data_source.subscribe_errors().await
     }
 }
 

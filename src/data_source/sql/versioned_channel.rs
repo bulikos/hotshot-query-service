@@ -10,8 +10,6 @@
 // You should have received a copy of the GNU General Public License along with this program. If not,
 // see <https://www.gnu.org/licenses/>.
 
-#![cfg(feature = "sql-data-source")]
-
 //! Async channel with versioning.
 //!
 //! A versioned channel is an async, in-memory broadcast channel with version awareness. Unlike a

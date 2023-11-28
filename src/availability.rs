@@ -289,7 +289,7 @@ mod test {
             mocks::{MockNodeImpl, MockTransaction, MockTypes},
             setup_test,
         },
-        Error, QueryResult,
+        Error,
     };
     use async_std::{sync::RwLock, task::spawn};
     use commit::Committable;
@@ -484,12 +484,12 @@ mod test {
         // preserves the consistency of the data and indices.
         let leaves = client
             .socket("stream/leaves/0")
-            .subscribe::<QueryResult<LeafQueryData<MockTypes, MockNodeImpl>>>()
+            .subscribe::<LeafQueryData<MockTypes, MockNodeImpl>>()
             .await
             .unwrap();
         let blocks = client
             .socket("stream/blocks/0")
-            .subscribe::<QueryResult<BlockQueryData<MockTypes>>>()
+            .subscribe::<BlockQueryData<MockTypes>>()
             .await
             .unwrap();
         let mut leaf_blocks = leaves.zip(blocks).enumerate();
@@ -502,8 +502,8 @@ mod test {
                 tracing::info!("waiting for block with transaction {}", nonce);
                 let (i, (leaf, block)) = leaf_blocks.next().await.unwrap();
                 tracing::info!("got block {}\nLeaf: {:?}\nBlock: {:?}", i, leaf, block);
-                let leaf = leaf.unwrap().unwrap();
-                let block = block.unwrap().unwrap();
+                let leaf = leaf.unwrap();
+                let block = block.unwrap();
                 assert_eq!(leaf.height() as usize, i);
                 assert_eq!(leaf.block_hash(), block.hash());
                 if !block.is_empty() {

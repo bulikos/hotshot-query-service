@@ -11,8 +11,7 @@
 // see <https://www.gnu.org/licenses/>.
 
 use super::query_data::{
-    BlockHash, BlockQueryData, LeafHash, LeafQueryData, QueryableBlock, TransactionHash,
-    TransactionIndex,
+    BlockHash, BlockQueryData, LeafQueryData, QueryableBlock, TransactionHash, TransactionIndex,
 };
 use crate::{Block, Deltas, Leaf, QueryError, QueryResult, Resolvable};
 use async_trait::async_trait;
@@ -71,10 +70,9 @@ pub type LeafId<Types, I> = ResourceId<Leaf<Types, I>>;
 #[derive(Derivative, Deserialize, Serialize)]
 #[derivative(Clone(bound = ""), Debug(bound = ""))]
 #[serde(bound = "")]
-pub struct ErrorEvent<Types, I>
+pub struct ErrorEvent<Types>
 where
     Types: NodeType,
-    I: NodeImplementation<Types>,
 {
     /// The error which triggered this event.
     pub error: QueryError,
@@ -85,29 +83,40 @@ where
     /// of the data source itself. In such cases, `context` includes any data required to retrieve
     /// this additional information, and these errors can be resolved by providing the required
     /// information (such as a block payload which was missing from storage).
-    pub context: Option<ErrorContext<Types, I>>,
+    pub context: Option<ErrorContext<Types>>,
 }
 
 /// Information about what was happening when an [`ErrorEvent`] event was triggered.
 #[derive(Derivative, Deserialize, Serialize)]
 #[derivative(Clone(bound = ""), Debug(bound = ""))]
 #[serde(bound = "")]
-pub enum ErrorContext<Types, I>
+pub enum ErrorContext<Types>
 where
     Types: NodeType,
-    I: NodeImplementation<Types>,
 {
     /// The data source was looking up a block which was not available in its storage.
     ///
     /// Fetching the block with the given hash and adding it to storage via
     /// [`UpdateAvailabilityData::insert_block`] may resolve the problem.
+    ///
+    /// Missing blocks are always requested by their hash, so that the hash of the retrieved block
+    /// may be compared with the requested hash, to ensure the correct data was retrieved.
     MissingBlock(BlockHash<Types>),
 
     /// The data source was looking up a leaf which was not available in its storage.
     ///
-    /// Fetching the leaf with the given hash and adding it to storage via
+    /// Fetching the leaf at the given height and adding it to storage via
     /// [`UpdateAvailabilityData::insert_leaf`] may resolve the problem.
-    MissingLeaf(LeafHash<Types, I>),
+    ///
+    /// Unlike blocks, which are requested by hash, missing leaves are requested by height. This is
+    /// because the expected hash of a missing block can be gotten from the corresponding leaf, but
+    /// if the leaf itself is missing, there is no way for us to know what the hash of the missing
+    /// leaf would be. Therefore, instead of authenticating retrieved leaves by hash, a fetcher
+    /// retrieving a leaf from an untrusted source will need to receive the appropriate signed QCs
+    /// justifying the finality of the retrieved leaf at the given height. This authentication is
+    /// internal to the specific fetcher implementation; the data source itself is not resonsible
+    /// for authenticating fetched leaves.
+    MissingLeaf(usize),
 }
 
 #[async_trait]
@@ -117,7 +126,7 @@ where
 {
     type LeafStream: Stream<Item = LeafQueryData<Types, I>> + Unpin + Send;
     type BlockStream: Stream<Item = BlockQueryData<Types>> + Unpin + Send;
-    type ErrorStream: Stream<Item = ErrorEvent<Types, I>> + Unpin + Send;
+    type ErrorStream: Stream<Item = ErrorEvent<Types>> + Unpin + Send;
 
     type LeafRange<'a, R>: 'a + Stream<Item = QueryResult<LeafQueryData<Types, I>>> + Unpin
     where

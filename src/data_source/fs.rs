@@ -384,7 +384,7 @@ where
 {
     type LeafStream = BoxStream<'static, LeafQueryData<Types, I>>;
     type BlockStream = BoxStream<'static, BlockQueryData<Types>>;
-    type ErrorStream = stream::Pending<ErrorEvent<Types, I>>;
+    type ErrorStream = stream::Pending<ErrorEvent<Types>>;
 
     type LeafRange<'a, R> = BoxStream<'a, QueryResult<LeafQueryData<Types, I>>>
     where

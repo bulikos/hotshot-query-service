@@ -20,8 +20,10 @@
 //! messages delivered to receivers. [`revert`](VersionedChannel::revert) can also be used to drop
 //! all buffered messages without ever notifying receivers.
 
-use async_compatibility_layer::async_primitives::broadcast::{channel, BroadcastSender};
-use futures::stream::{self, Stream};
+use async_compatibility_layer::async_primitives::broadcast::{
+    channel, BroadcastReceiver, BroadcastSender,
+};
+use derivative::Derivative;
 
 /// An async channel with versioning.
 #[derive(Debug)]
@@ -43,17 +45,10 @@ impl<T: Clone> VersionedChannel<T> {
     ///
     /// Messages sent and committed via this sender will be delivered to all subscribers which exist
     /// at the time the messages are committed.
-    pub(super) async fn subscribe(&self) -> impl Stream<Item = T> {
-        stream::unfold(self.inner.handle_async().await, |mut handle| async move {
-            match handle.recv_async().await {
-                Ok(msg) => Some((msg, handle)),
-                Err(_) => {
-                    // An error in receive means the send end of the channel has been disconnected,
-                    // which means the stream is over.
-                    None
-                }
-            }
-        })
+    pub(super) async fn subscribe(&self) -> VersionedReceiver<T> {
+        VersionedReceiver {
+            inner: self.inner.handle_async().await,
+        }
     }
 
     /// Tentatively send a message to the channel.
@@ -82,5 +77,41 @@ impl<T: Clone> VersionedChannel<T> {
     /// [`revert`](Self::revert) will be dropped.
     pub(super) fn revert(&mut self) {
         self.pending.clear();
+    }
+}
+
+/// The receive end of an async channel with versioning.
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub(super) struct VersionedReceiver<T> {
+    #[derivative(Debug = "ignore")]
+    inner: BroadcastReceiver<T>,
+}
+
+impl<T: Clone> VersionedReceiver<T> {
+    /// Wait for the next message to be ready to be received.
+    ///
+    /// This function returns the next message in the stream. If no messages are immediately
+    /// available, it will suspend until a new message is received.
+    pub(super) async fn next(&mut self) -> Option<T> {
+        // An error in receive means the send end of the channel has been disconnected, which means
+        // the stream is over, so we return [`None`] in that case.
+        self.inner.recv_async().await.ok()
+    }
+
+    /// Receive the next message, if one is available.
+    ///
+    /// This function will not suspend if no new messages are immediately available. Instead it will
+    /// simply return [`None`].
+    pub(super) fn try_next(&mut self) -> Option<T> {
+        self.inner.try_recv()
+    }
+
+    /// Drain the receiver of buffered messages.
+    ///
+    /// This will free all messages which are ready to be received but have not been received yet.
+    /// It will not block waiting for new messages to be ready for receiving.
+    pub(super) fn drain(&mut self) {
+        while self.try_next().is_some() {}
     }
 }

@@ -106,6 +106,18 @@
 //! the persistence layer, which we call a _data source_. This crate provides several data source
 //! implementations in the [`data_source`] module.
 //!
+//! # Data Retrieval
+//!
+//! The query service does its best to maintain all the relevant data in its own persistent storage.
+//! However, in real-world scenarios, things occasionally go wrong. Perhaps there was a fault in
+//! local storage and some data got corrupted. Maybe the HotShot instance attached to this query
+//! service temporarily went offline and never received the data for a certain block. For these
+//! cases, it is possible to attach the query service to an external data availability provider,
+//! which it can use to retrieve missing data.
+//!
+//! This crate provides several implementations of data availability clients in the [`fetcher`]
+//! module.
+//!
 //! # Interaction with other components
 //!
 //! While the HotShot Query Service [can be used as a standalone service](run_standalone_service),
@@ -353,6 +365,7 @@ mod api;
 pub mod availability;
 pub mod data_source;
 mod error;
+pub mod fetcher;
 pub mod metrics;
 mod resolvable;
 pub mod status;
@@ -401,6 +414,7 @@ pub enum QueryError {
     Missing,
     /// There was an error while trying to fetch the requested resource.
     #[snafu(display("Failed to fetch requested resource: {message}"))]
+    #[snafu(context(suffix(QueryErrorSnafu)))]
     Error { message: String },
 }
 

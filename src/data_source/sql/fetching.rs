@@ -25,7 +25,10 @@ use super::{
     versioned_channel::VersionedReceiver,
 };
 use crate::{
-    availability::{BlockQueryData, ErrorContext, ErrorEvent, LeafQueryData, ResourceId},
+    availability::{
+        BlockQueryData, ErrorEvent, LeafQueryData, MissingBlockContext, MissingLeafContext,
+        ResourceId,
+    },
     Block, Deltas, Leaf, NotFoundSnafu, QueryError, QueryResult, QueryableBlock, Resolvable,
 };
 use async_compatibility_layer::async_primitives::broadcast::BroadcastSender;
@@ -39,6 +42,7 @@ use futures::{
 use hotshot_types::traits::node_implementation::{NodeImplementation, NodeType};
 use snafu::OptionExt;
 use std::ops::{Bound, RangeBounds};
+use time::OffsetDateTime;
 use tokio_postgres::{types::ToSql, Client};
 
 /// Abstraction for some functionality which is common to blocks and leaves.
@@ -217,7 +221,7 @@ where
         // Send a missing leaf error event to trigger the external fetcher to retrieve the leaf.
         let event = ErrorEvent {
             error: QueryError::Missing,
-            context: Some(ErrorContext::MissingLeaf(height)),
+            context: Some(MissingLeafContext { height }.into()),
         };
         if errors.send_async(event.clone()).await.is_err() {
             // If the send fails, it means there is no fetcher task waiting on the other end of this
@@ -285,18 +289,18 @@ where
         // requested hash and verify we got the right data. So first, we need to look up the
         // expected hash for this height from the database. This function blocks until it succeeds,
         // rather than returning errors, so we need to retry if we get transient database errors.
-        let hash = loop {
+        let (hash, timestamp) = loop {
             match client
                 .query_opt(
-                    "SELECT hash FROM header WHERE height = $1",
+                    "SELECT hash, timestamp FROM header WHERE height = $1",
                     &[&(height as i64)],
                 )
                 .await
             {
                 Ok(Some(row)) => {
                     let hash_str: String = row.get("hash");
-                    match hash_str.parse() {
-                        Ok(hash) => break hash,
+                    let hash = match hash_str.parse() {
+                        Ok(hash) => hash,
                         Err(err) => {
                             // We got something from the database that doesn't represent a block
                             // hash. This should never happen, since we are fully in control of what
@@ -305,14 +309,16 @@ where
                             tracing::warn!("invalid hash {hash_str} for block {height}: {err}");
                             continue;
                         }
-                    }
+                    };
+                    let timestamp: OffsetDateTime = row.get("timestamp");
+                    break (hash, timestamp);
                 }
                 Ok(None) => {
                     // If the query succeeded, but the requested header was not there, we need to
                     // fetch the missing leaf (which includes the header) in order to find the block
                     // hash that we are supposed to be looking up.
                     let leaf = self.leaves.fetch(client, errors, height).await;
-                    break leaf.block_hash();
+                    break (leaf.block_hash(), leaf.timestamp());
                 }
                 Err(err) => {
                     // The query failed for some reason. We don't know if the leaf is available or
@@ -326,7 +332,14 @@ where
         // Send a missing block error event to trigger the external fetcher to retrieve the block.
         let event = ErrorEvent {
             error: QueryError::Missing,
-            context: Some(ErrorContext::MissingBlock(hash)),
+            context: Some(
+                MissingBlockContext {
+                    hash,
+                    timestamp: timestamp.unix_timestamp_nanos(),
+                    height: height as u64,
+                }
+                .into(),
+            ),
         };
         if errors.send_async(event.clone()).await.is_err() {
             // If the send fails, it means there is no fetcher task waiting on the other end of this

@@ -87,7 +87,7 @@ where
 }
 
 /// Information about what was happening when an [`ErrorEvent`] event was triggered.
-#[derive(Derivative, Deserialize, Serialize)]
+#[derive(Derivative, Deserialize, Serialize, From)]
 #[derivative(Clone(bound = ""), Debug(bound = ""))]
 #[serde(bound = "")]
 pub enum ErrorContext<Types>
@@ -100,8 +100,11 @@ where
     /// [`UpdateAvailabilityData::insert_block`] may resolve the problem.
     ///
     /// Missing blocks are always requested by their hash, so that the hash of the retrieved block
-    /// may be compared with the requested hash, to ensure the correct data was retrieved.
-    MissingBlock(BlockHash<Types>),
+    /// may be compared with the requested hash, to ensure the correct data was retrieved. The
+    /// context for a missing block also includes additional information from the block header, such
+    /// as `height` and `timestamp`, so that the fetcher can retrieve a simple [`Block`] and use the
+    /// extra context to reconstruct a [`BlockQueryData`].
+    MissingBlock(MissingBlockContext<Types>),
 
     /// The data source was looking up a leaf which was not available in its storage.
     ///
@@ -116,7 +119,34 @@ where
     /// justifying the finality of the retrieved leaf at the given height. This authentication is
     /// internal to the specific fetcher implementation; the data source itself is not resonsible
     /// for authenticating fetched leaves.
-    MissingLeaf(usize),
+    MissingLeaf(MissingLeafContext),
+}
+
+/// Context for a missing block.
+///
+/// This type includes sufficient context to retrieve the desired block and build a
+/// [`BlockQueryData`] from it.
+#[derive(Derivative, Deserialize, Serialize)]
+#[derivative(Clone(bound = ""), Debug(bound = ""))]
+#[serde(bound = "")]
+pub struct MissingBlockContext<Types>
+where
+    Types: NodeType,
+{
+    pub hash: BlockHash<Types>,
+    pub height: u64,
+    pub timestamp: i128,
+}
+
+/// Context for a missing leaf.
+///
+/// This type includes sufficient context to retrieve the desired leaf and build a
+/// [`LeafQueryData`] from it.
+#[derive(Derivative, Deserialize, Serialize)]
+#[derivative(Clone(bound = ""), Debug(bound = ""))]
+#[serde(bound = "")]
+pub struct MissingLeafContext {
+    pub height: usize,
 }
 
 #[async_trait]

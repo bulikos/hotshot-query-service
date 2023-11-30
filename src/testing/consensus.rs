@@ -13,18 +13,19 @@
 use super::mocks::{
     MockBlock, MockMembership, MockNodeImpl, MockTransaction, MockTypes, TestableDataSource,
 };
-use crate::data_source::FileSystemDataSource;
+use crate::{data_source::FileSystemDataSource, Resolvable};
 use async_std::{
     sync::{Arc, RwLock},
     task::spawn,
 };
+use either::Either;
 use futures::{future::join_all, stream::StreamExt};
 use hotshot::{
     traits::{
         implementations::{MasterMap, MemoryCommChannel, MemoryNetwork, MemoryStorage},
         NodeImplementation,
     },
-    types::SystemContextHandle,
+    types::{EventType, SystemContextHandle},
     HotShotInitializer, SystemContext,
 };
 use hotshot_signature_key::bn254::{BN254Priv, BN254Pub};
@@ -55,7 +56,10 @@ const MINIMUM_NODES: usize = 2;
 
 impl<D: TestableDataSource> MockNetwork<D> {
     pub async fn init() -> Self {
-        let priv_keys = (0..MINIMUM_NODES)
+        // Create a network with one extra node which will not be part of the DA committee. This
+        // tests the ability of that node's query service to fetch block data that it doesn't
+        // receive via consensus from alternative sources.
+        let priv_keys = (0..MINIMUM_NODES + 1)
             .map(|_| BN254Priv::generate())
             .collect::<Vec<_>>();
         let pub_keys = priv_keys
@@ -83,7 +87,7 @@ impl<D: TestableDataSource> MockNetwork<D> {
             num_bootstrap: 0,
             execution_type: ExecutionType::Continuous,
             election_config: None,
-            da_committee_size: total_nodes.into(),
+            da_committee_size: MINIMUM_NODES,
         };
         let nodes = join_all(
             priv_keys
@@ -173,11 +177,29 @@ impl<D: TestableDataSource> MockNetwork<D> {
 impl<D: TestableDataSource> MockNetwork<D> {
     pub async fn start(&mut self) {
         // Spawn the update tasks.
-        for node in &mut self.nodes {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
             let ds = node.data_source.clone();
             let mut events = node.hotshot.get_event_stream(Default::default()).await.0;
             spawn(async move {
-                while let Some(event) = events.next().await {
+                while let Some(mut event) = events.next().await {
+                    if i >= MINIMUM_NODES {
+                        // For nodes that are not supposed to receive block data directly from
+                        // consensus, but are expected instead to fetch it from other nodes...ensure
+                        // they don't get it from consensus.
+                        if let EventType::Decide { leaf_chain, .. } = &mut event.event {
+                            *leaf_chain = Arc::new(
+                                leaf_chain
+                                    .iter()
+                                    .map(|leaf| {
+                                        let mut leaf = leaf.clone();
+                                        leaf.deltas = Either::Right(leaf.deltas.commitment());
+                                        leaf
+                                    })
+                                    .collect(),
+                            );
+                        }
+                    }
+
                     tracing::info!("EVENT {:?}", event.event);
                     let mut ds = ds.write().await;
                     ds.update(&event).await.unwrap();

@@ -30,6 +30,7 @@ use crate::{
     status::data_source::StatusDataSource,
     Block, Deltas, MissingSnafu, NotFoundSnafu, QueryResult, Resolvable,
 };
+use async_compatibility_layer::async_primitives::broadcast::{channel, BroadcastSender};
 use async_trait::async_trait;
 use atomic_store::{AtomicStore, AtomicStoreLoader, PersistenceError};
 use commit::Committable;
@@ -181,6 +182,7 @@ where
     leaf_storage: LedgerLog<LeafQueryData<Types, I>>,
     block_storage: LedgerLog<BlockQueryData<Types>>,
     metrics: PrometheusMetrics,
+    error_stream: BroadcastSender<ErrorEvent<Types>>,
 }
 
 impl<Types: NodeType, I: NodeImplementation<Types>> FileSystemDataSource<Types, I>
@@ -232,6 +234,7 @@ where
             leaf_storage: LedgerLog::create(loader, "leaves", CACHED_LEAVES_COUNT)?,
             block_storage: LedgerLog::create(loader, "blocks", CACHED_BLOCKS_COUNT)?,
             metrics: Default::default(),
+            error_stream: channel().0,
         })
     }
 
@@ -284,6 +287,7 @@ where
             block_storage,
             top_storage: None,
             metrics: Default::default(),
+            error_stream: channel().0,
         })
     }
 
@@ -384,7 +388,7 @@ where
 {
     type LeafStream = BoxStream<'static, LeafQueryData<Types, I>>;
     type BlockStream = BoxStream<'static, BlockQueryData<Types>>;
-    type ErrorStream = stream::Pending<ErrorEvent<Types>>;
+    type ErrorStream = BoxStream<'static, ErrorEvent<Types>>;
 
     type LeafRange<'a, R> = BoxStream<'a, QueryResult<LeafQueryData<Types, I>>>
     where
@@ -497,11 +501,20 @@ where
     }
 
     async fn subscribe_errors(&self) -> Self::ErrorStream {
-        // Error recovery is not yet implemented for [`FileSystemDataSource`], since the underlying
-        // [`AppendLog`]-based storage does not support out-of-order insertion of blocks and leaves
-        // retrieved in response to errors. For now, return a stream that never yields any events.
-        // To fix this: https://github.com/EspressoSystems/hotshot-query-service/issues/16.
-        stream::pending()
+        stream::unfold(
+            self.error_stream.handle_async().await,
+            |mut handle| async move {
+                match handle.recv_async().await {
+                    Ok(obj) => Some((obj, handle)),
+                    Err(_) => {
+                        // An error in receive means the send end of the channel has been disconnected,
+                        // which means the stream is over.
+                        None
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 }
 
@@ -543,6 +556,14 @@ where
             );
         }
         Ok(())
+    }
+
+    async fn raise_error(&mut self, event: ErrorEvent<Types>) {
+        if self.error_stream.send_async(event).await.is_err() {
+            // If the send fails, it means there is no one listening, so all we can do is swallow
+            // the error.
+            tracing::debug!("failed to send error event, no listeners");
+        }
     }
 }
 

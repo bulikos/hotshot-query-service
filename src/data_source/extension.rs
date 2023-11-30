@@ -13,8 +13,8 @@
 use super::VersionedDataSource;
 use crate::{
     availability::{
-        AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData, QueryableBlock,
-        TransactionHash, TransactionIndex, UpdateAvailabilityData,
+        AvailabilityDataSource, BlockId, BlockQueryData, ErrorEvent, LeafId, LeafQueryData,
+        QueryableBlock, TransactionHash, TransactionIndex, UpdateAvailabilityData,
     },
     metrics::PrometheusMetrics,
     status::StatusDataSource,
@@ -222,6 +222,10 @@ where
 
     async fn insert_block(&mut self, block: BlockQueryData<Types>) -> Result<(), Self::Error> {
         self.data_source.insert_block(block).await
+    }
+
+    async fn raise_error(&mut self, error: ErrorEvent<Types>) {
+        self.data_source.raise_error(error).await
     }
 }
 

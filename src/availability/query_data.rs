@@ -415,13 +415,13 @@ fn parse_timestamp(ns: i128) -> Timestamp {
     Timestamp::from_unix_timestamp_nanos(ns).expect("HotShot timestamp out of range")
 }
 
-fn round_timestamp(ns: i128) -> i128 {
+pub(crate) fn round_timestamp(ns: i128) -> i128 {
     // HotShot gives us the timestamp with nanosecond precision, which is far more than necessary
     // and can't be stored accurately in Postgres. Round down to microsecond precision.
     (ns / 1000) * 1000
 }
 
-fn leaf_height<L: LeafType>(leaf: &L) -> u64 {
+pub(crate) fn leaf_height<L: LeafType>(leaf: &L) -> u64 {
     // HotShot generates a genesis leaf with height 0, but we don't see it in the event stream.
     // Therefore, the first leaf we see has height 1. But to clients, the first leaf should have
     // height 0, since there is nothing before it, so we adjust the height here.

@@ -977,6 +977,14 @@ where
         self.block_stream.send(block);
         Ok(())
     }
+
+    async fn raise_error(&mut self, event: ErrorEvent<Types>) {
+        if self.error_stream.send_async(event).await.is_err() {
+            // If the send fails, it means there is no one listening, so all we can do is swallow
+            // the error.
+            tracing::debug!("failed to send error event, no listeners");
+        }
+    }
 }
 
 #[async_trait]

@@ -13,8 +13,11 @@
 //! A generic algorithm for updating a HotShot Query Service data source with new data.
 use crate::status::UpdateStatusData;
 use crate::{
-    availability::{BlockQueryData, LeafQueryData, QueryableBlock, UpdateAvailabilityData},
-    Block, Deltas, Leaf, Resolvable,
+    availability::{
+        leaf_height, round_timestamp, BlockQueryData, ErrorEvent, LeafQueryData,
+        MissingBlockContext, QueryableBlock, UpdateAvailabilityData,
+    },
+    Block, Deltas, Leaf, QueryError, Resolvable,
 };
 use async_trait::async_trait;
 use hotshot::types::{Event, EventType};
@@ -83,17 +86,6 @@ where
                 // leaf in the new chain, so we don't need it.
                 .skip(1);
             for (qc, leaf) in qcs.zip(leaf_chain.iter().rev()) {
-                // The current version of HotShot has a guarantee that the block is available at the
-                // moment the corresponding leaf is sequenced, so for the time being, we can get the
-                // block by resolving the deltas and panicking if the block is not available. This
-                // will change in the future, at which time this will have to be rewritten to spawn
-                // a background task to resolve the block asynchronously and update the query data
-                // when the block becomes available.
-                let block = leaf
-                    .get_deltas()
-                    .try_resolve()
-                    .expect("block was not available at moment leaf was sequenced");
-
                 // `LeafQueryData::new` only fails if `qc` does not reference `leaf`. We have just
                 // gotten `leaf` and `qc` directly from a consensus `Decide` event, so they are
                 // guaranteed to correspond, and this should never panic.
@@ -101,11 +93,38 @@ where
                     LeafQueryData::new(leaf.clone(), qc.clone()).expect("inconsistent leaf"),
                 )
                 .await?;
-                // For the same reason, this will not panic either.
-                self.insert_block(
-                    BlockQueryData::new::<I>(leaf, &qc, block).expect("inconsistent block"),
-                )
-                .await?;
+
+                match leaf.get_deltas().try_resolve() {
+                    Ok(block) => {
+                        // This `expect` will not panic for the same reason as the `expect` above in
+                        // `LeafQueryData::new`.
+                        self.insert_block(
+                            BlockQueryData::new::<I>(leaf, &qc, block).expect("inconsistent block"),
+                        )
+                        .await?;
+                    }
+                    Err(_) => {
+                        // If the HotShot instance we are connected to is not on the DA committee
+                        // for this block, or even if it is but was not needed to form a quorum of
+                        // the committee, we may not have immediate access to the block payload. In
+                        // this case, raise an error on behalf of the data source alerting any
+                        // attached fetchers that they should try to retrieve this block.
+                        let height = leaf_height(leaf);
+                        tracing::info!("payload for block {height} not immediately available, fetching asynchronously");
+                        self.raise_error(ErrorEvent {
+                            error: QueryError::Missing,
+                            context: Some(
+                                MissingBlockContext {
+                                    hash: leaf.get_deltas().commitment(),
+                                    height,
+                                    timestamp: round_timestamp(leaf.get_timestamp()),
+                                }
+                                .into(),
+                            ),
+                        })
+                        .await;
+                    }
+                }
             }
         }
         Ok(())

@@ -223,4 +223,5 @@ where
     where
         Deltas<Types, I>: Resolvable<Block<Types>>;
     async fn insert_block(&mut self, block: BlockQueryData<Types>) -> Result<(), Self::Error>;
+    async fn raise_error(&mut self, event: ErrorEvent<Types>);
 }

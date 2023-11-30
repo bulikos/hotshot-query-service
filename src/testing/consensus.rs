@@ -13,7 +13,7 @@
 use super::mocks::{
     MockBlock, MockMembership, MockNodeImpl, MockTransaction, MockTypes, TestableDataSource,
 };
-use crate::{data_source::FileSystemDataSource, Resolvable};
+use crate::{data_source::SqlDataSource, Resolvable};
 use async_std::{
     sync::{Arc, RwLock},
     task::spawn,
@@ -50,7 +50,7 @@ pub struct MockNetwork<D: TestableDataSource> {
 
 // MockNetwork can be used with any TestableDataSource, but it's nice to have a default with a
 // convenient type alias.
-pub type MockDataSource = FileSystemDataSource<MockTypes, MockNodeImpl>;
+pub type MockDataSource = SqlDataSource<MockTypes, MockNodeImpl>;
 
 const MINIMUM_NODES: usize = 2;
 
@@ -161,6 +161,10 @@ impl<D: TestableDataSource> MockNetwork<D> {
 
     pub fn data_source(&self) -> Arc<RwLock<D>> {
         self.nodes[0].data_source.clone()
+    }
+
+    pub fn non_da_data_source(&self) -> Arc<RwLock<D>> {
+        self.nodes[MINIMUM_NODES].data_source.clone()
     }
 
     pub async fn shut_down(mut self) {

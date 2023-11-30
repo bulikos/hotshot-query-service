@@ -113,3 +113,71 @@ fn server_error(err: Error) -> QueryError {
         message: err.to_string(),
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{
+        availability::{define_api, AvailabilityDataSource},
+        fetcher::{run, testing::TestFetcher},
+        testing::{
+            consensus::{MockDataSource, MockNetwork},
+            setup_test, sleep,
+        },
+    };
+    use async_std::{sync::Arc, task::spawn};
+    use futures::stream::StreamExt;
+    use portpicker::pick_unused_port;
+    use std::time::Duration;
+    use tide_disco::App;
+
+    #[async_std::test]
+    async fn test_fetch_on_decide() {
+        setup_test();
+
+        // Create the consensus network.
+        let mut network = MockNetwork::<MockDataSource>::init().await;
+
+        // Start a web server that the non-DA node can use to fetch blocks.
+        let port = pick_unused_port().unwrap();
+        let mut app = App::<_, Error>::with_state(network.data_source());
+        app.register_module("availability", define_api(&Default::default()).unwrap())
+            .unwrap();
+        spawn(app.serve(format!("0.0.0.0:{port}")));
+
+        // Attach a fetcher to the non-DA node.
+        let data_source = network.non_da_data_source();
+        let fetcher = Arc::new(TestFetcher::new(
+            QueryServiceFetcher::new(format!("http://localhost:{port}").parse().unwrap()).await,
+        ));
+        spawn(run(fetcher.clone(), data_source.clone()));
+
+        // Block requests to the fetcher so that we can verify that without the fetcher, the non-DA
+        // node does _not_ get block data from consensus.
+        fetcher.block().await;
+
+        // Start consensus.
+        network.start().await;
+
+        // Wait for there to be a decide.
+        let mut leaves = { data_source.read().await.subscribe_leaves(0).await.unwrap() };
+        leaves.next().await;
+
+        // Give the block even some extra time to propagate, and check that we still can't get it
+        // from the non-DA node, since the fetcher is blocked. This just ensures the integrity of
+        // the test by checking the node didn't mysteriously get the block from somewhere else, so
+        // that when we unblock the fetcher and the node finally gets the block, we know it came
+        // from the fetcher.
+        sleep(Duration::from_secs(1)).await;
+        let err = { data_source.read().await.get_block(0).await.unwrap_err() };
+        assert!(matches!(err, QueryError::Missing), "{err}");
+
+        // Unblock the request and see that we eventually receive the block in the non-DA node.
+        fetcher.unblock().await;
+        let mut blocks = { data_source.read().await.subscribe_blocks(0).await.unwrap() };
+        let block = blocks.next().await.unwrap();
+        assert_eq!(block, {
+            data_source.read().await.get_block(0).await.unwrap()
+        });
+    }
+}

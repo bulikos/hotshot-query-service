@@ -498,12 +498,10 @@ mod test {
             AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData,
             TransactionHash, TransactionIndex,
         },
+        data_source::FileSystemDataSource,
         metrics::PrometheusMetrics,
         status::StatusDataSource,
-        testing::{
-            consensus::MockDataSource,
-            mocks::{MockNodeImpl, MockTypes},
-        },
+        testing::mocks::{MockNodeImpl, MockTypes},
     };
     use async_std::{sync::RwLock, task::spawn};
     use async_trait::async_trait;
@@ -520,23 +518,25 @@ mod test {
     use tide_disco::App;
     use toml::toml;
 
+    type DataSource = FileSystemDataSource<MockTypes, MockNodeImpl>;
+
     struct CompositeState {
         store: AtomicStore,
-        hotshot_qs: MockDataSource,
+        hotshot_qs: DataSource,
         module_state: RollingLog<BincodeLoadStore<u64>>,
     }
 
     #[async_trait]
     impl AvailabilityDataSource<MockTypes, MockNodeImpl> for CompositeState {
         type LeafStream =
-            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::LeafStream;
+            <DataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::LeafStream;
         type BlockStream =
-            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::BlockStream;
+            <DataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::BlockStream;
         type ErrorStream =
-            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::ErrorStream;
+            <DataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::ErrorStream;
 
         type LeafRange<'a, R> =
-            <MockDataSource as AvailabilityDataSource<
+            <DataSource as AvailabilityDataSource<
                 MockTypes,
                 MockNodeImpl,
             >>::LeafRange<'a, R>
@@ -544,7 +544,7 @@ mod test {
             Self: 'a,
             R: RangeBounds<usize> + Send;
         type BlockRange<'a, R> =
-            <MockDataSource as AvailabilityDataSource<
+            <DataSource as AvailabilityDataSource<
                 MockTypes,
                 MockNodeImpl,
             >>::BlockRange<'a, R>
@@ -619,7 +619,7 @@ mod test {
     async fn test_composition() {
         let dir = TempDir::new("test_composition").unwrap();
         let mut loader = AtomicStoreLoader::create(dir.path(), "test_composition").unwrap();
-        let hotshot_qs = MockDataSource::create_with_store(&mut loader).unwrap();
+        let hotshot_qs = DataSource::create_with_store(&mut loader).unwrap();
         let module_state =
             RollingLog::create(&mut loader, Default::default(), "module_state", 1024).unwrap();
         let state = CompositeState {

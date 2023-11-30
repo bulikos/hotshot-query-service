@@ -32,6 +32,7 @@
 //!
 //! We also provide combinators for modularly adding functionality to existing fetchers:
 //! * [`AnyFetcher`]
+//! * [`TestFetcher`](testing::TestFetcher)
 //!
 //! Finally, we provide an async task [`run`], which attaches a data fetcher to a [`data
 //! source`](crate::data_source) so that it can resolve missing data errors encountered by the data
@@ -57,6 +58,7 @@ use std::{collections::HashSet, fmt::Debug, hash::Hash};
 
 mod any;
 mod query_service;
+pub mod testing;
 
 pub use any::AnyFetcher;
 pub use query_service::QueryServiceFetcher;

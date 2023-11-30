@@ -118,15 +118,16 @@ fn server_error(err: Error) -> QueryError {
 mod test {
     use super::*;
     use crate::{
-        availability::{define_api, AvailabilityDataSource},
+        availability::{define_api, leaf_height, AvailabilityDataSource},
         fetcher::{run, testing::TestFetcher},
         testing::{
-            consensus::{MockDataSource, MockNetwork},
+            consensus::{MockDataSource, MockNetwork, MINIMUM_NODES},
             setup_test, sleep,
         },
     };
     use async_std::{sync::Arc, task::spawn};
     use futures::stream::StreamExt;
+    use hotshot::types::EventType;
     use portpicker::pick_unused_port;
     use std::time::Duration;
     use tide_disco::App;
@@ -179,5 +180,80 @@ mod test {
         assert_eq!(block, {
             data_source.read().await.get_block(0).await.unwrap()
         });
+    }
+
+    #[async_std::test]
+    async fn test_catchup() {
+        setup_test();
+
+        // Create the consensus network.
+        let mut network = MockNetwork::<MockDataSource>::init().await;
+
+        // Start a web server that the non-DA node can use to fetch blocks.
+        let port = pick_unused_port().unwrap();
+        let mut app = App::<_, Error>::with_state(network.data_source());
+        app.register_module("availability", define_api(&Default::default()).unwrap())
+            .unwrap();
+        spawn(app.serve(format!("0.0.0.0:{port}")));
+
+        // Start all but the non-DA node.
+        network.start_nodes(..MINIMUM_NODES).await;
+
+        // Wait for there to be a decide.
+        let mut leaves = {
+            network
+                .data_source()
+                .read()
+                .await
+                .subscribe_leaves(0)
+                .await
+                .unwrap()
+        };
+        leaves.next().await;
+
+        // Attach a fetcher to the non-DA node. Block requests so that we can verify that without
+        // the fetcher, the non-DA node does _not_ get block data from consensus.
+        let data_source = network.non_da_data_source();
+        let fetcher = Arc::new(TestFetcher::new(
+            QueryServiceFetcher::new(format!("http://localhost:{port}").parse().unwrap()).await,
+        ));
+        fetcher.block().await;
+        spawn(run(fetcher.clone(), data_source.clone()));
+
+        // Start consensus on the non-DA node and wait for it to catch up and start generating
+        // decides.
+        let mut events = network
+            .non_da_handle()
+            .get_event_stream(Default::default())
+            .await
+            .0;
+        network.start_nodes(MINIMUM_NODES..).await;
+        let block_height = loop {
+            let event = events.next().await.unwrap();
+            if let EventType::Decide { leaf_chain, .. } = event.event {
+                break leaf_height(&leaf_chain[0]);
+            }
+        };
+
+        // Without the fetcher, we missed the first decide event.
+        let err = { data_source.read().await.get_block(0).await.unwrap_err() };
+        assert!(matches!(err, QueryError::Missing), "{err}");
+        let err = { data_source.read().await.get_leaf(0).await.unwrap_err() };
+        assert!(matches!(err, QueryError::Missing), "{err}");
+
+        // Unblock the fetcher, then we should eventually be able to get all the blocks we missed.
+        fetcher.unblock().await;
+
+        let data_source = data_source.read().await;
+        let mut blocks = data_source.subscribe_blocks(0).await.unwrap();
+        let mut leaves = data_source.subscribe_leaves(0).await.unwrap();
+        for i in 0..=block_height {
+            let block = blocks.next().await.unwrap();
+            let leaf = leaves.next().await.unwrap();
+            assert_eq!(block.height(), i);
+            assert_eq!(leaf.height(), i);
+            assert_eq!(block, data_source.get_block(i as usize).await.unwrap());
+            assert_eq!(leaf, data_source.get_leaf(i as usize).await.unwrap());
+        }
     }
 }

@@ -36,11 +36,13 @@ use hotshot_types::{
     ExecutionType, HotShotConfig,
 };
 use std::num::NonZeroUsize;
+use std::slice::SliceIndex;
 use std::time::Duration;
 
-struct MockNode<D: TestableDataSource> {
+pub struct MockNode<D: TestableDataSource> {
     hotshot: SystemContextHandle<MockTypes, MockNodeImpl>,
     data_source: Arc<RwLock<D>>,
+    id: usize,
     _tmp_data: D::TmpData,
 }
 
@@ -52,7 +54,7 @@ pub struct MockNetwork<D: TestableDataSource> {
 // convenient type alias.
 pub type MockDataSource = SqlDataSource<MockTypes, MockNodeImpl>;
 
-const MINIMUM_NODES: usize = 2;
+pub const MINIMUM_NODES: usize = 3;
 
 impl<D: TestableDataSource> MockNetwork<D> {
     pub async fn init() -> Self {
@@ -139,6 +141,7 @@ impl<D: TestableDataSource> MockNetwork<D> {
                         MockNode {
                             hotshot,
                             data_source: Arc::new(RwLock::new(data_source)),
+                            id: node_id,
                             _tmp_data: tmp_data,
                         }
                     }
@@ -167,6 +170,10 @@ impl<D: TestableDataSource> MockNetwork<D> {
         self.nodes[MINIMUM_NODES].data_source.clone()
     }
 
+    pub fn non_da_handle(&self) -> SystemContextHandle<MockTypes, MockNodeImpl> {
+        self.nodes[MINIMUM_NODES].hotshot.clone()
+    }
+
     pub async fn shut_down(mut self) {
         self.shut_down_impl().await
     }
@@ -180,13 +187,21 @@ impl<D: TestableDataSource> MockNetwork<D> {
 
 impl<D: TestableDataSource> MockNetwork<D> {
     pub async fn start(&mut self) {
+        self.start_nodes(..).await;
+    }
+
+    pub async fn start_nodes<R>(&mut self, range: R)
+    where
+        R: SliceIndex<[MockNode<D>], Output = [MockNode<D>]> + Clone,
+    {
         // Spawn the update tasks.
-        for (i, node) in self.nodes.iter_mut().enumerate() {
+        for node in &mut self.nodes[range.clone()] {
+            let id = node.id;
             let ds = node.data_source.clone();
             let mut events = node.hotshot.get_event_stream(Default::default()).await.0;
             spawn(async move {
                 while let Some(mut event) = events.next().await {
-                    if i >= MINIMUM_NODES {
+                    if id >= MINIMUM_NODES {
                         // For nodes that are not supposed to receive block data directly from
                         // consensus, but are expected instead to fetch it from other nodes...ensure
                         // they don't get it from consensus.
@@ -213,7 +228,7 @@ impl<D: TestableDataSource> MockNetwork<D> {
         }
 
         join_all(
-            self.nodes
+            self.nodes[range]
                 .iter()
                 .map(|node| node.hotshot.hotshot.start_consensus()),
         )

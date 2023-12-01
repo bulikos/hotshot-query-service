@@ -25,10 +25,11 @@ use crate::{
             BlockHash, BlockQueryData, LeafHash, LeafQueryData, QueryableBlock, TransactionHash,
             TransactionIndex,
         },
+        Fetch,
     },
     metrics::PrometheusMetrics,
     status::data_source::StatusDataSource,
-    Block, Deltas, MissingSnafu, NotFoundSnafu, QueryResult, Resolvable,
+    Block, Deltas, MissingSnafu, QueryResult, Resolvable,
 };
 use async_trait::async_trait;
 use atomic_store::{AtomicStore, AtomicStoreLoader, PersistenceError};
@@ -39,7 +40,6 @@ use hotshot_types::traits::{
     signature_key::EncodedPublicKey,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use snafu::OptionExt;
 use std::collections::hash_map::{Entry, HashMap};
 use std::hash::Hash;
 use std::ops::{Bound, RangeBounds};
@@ -337,12 +337,16 @@ where
 }
 
 async fn range_stream<T>(
-    mut iter: Iter<'_, T>,
+    iter: Iter<'_, T>,
     range: impl RangeBounds<usize>,
-) -> impl '_ + Stream<Item = QueryResult<T>>
+) -> impl Stream<Item = Fetch<T>>
 where
     T: Clone + Serialize + DeserializeOwned + Sync,
 {
+    // Avoid capturing the lifetime of `iter` in the returned stream by reading the elements into
+    // memory eagerly.
+    let mut iter = iter.collect::<Vec<_>>().into_iter();
+
     let start = range.start_bound().cloned();
     let end = range.end_bound().cloned();
 
@@ -371,8 +375,8 @@ where
         if reached_end {
             return None;
         }
-        let opt = iter.next()?;
-        Some((opt.context(MissingSnafu), (iter, end, pos + 1)))
+        let opt = iter.next().expect("TODO FETCH");
+        Some((Fetch::Ready(opt.expect("TODO FETCH")), (iter, end, pos + 1)))
     })
 }
 
@@ -382,119 +386,70 @@ impl<Types: NodeType, I: NodeImplementation<Types>> AvailabilityDataSource<Types
 where
     Block<Types>: QueryableBlock,
 {
-    type LeafStream = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>;
-    type BlockStream = BoxStream<'static, QueryResult<BlockQueryData<Types>>>;
-
-    type LeafRange<'a, R> = BoxStream<'a, QueryResult<LeafQueryData<Types, I>>>
+    type LeafRange<R> = BoxStream<'static, Fetch<LeafQueryData<Types, I>>>
     where
-        Self: 'a,
         R: RangeBounds<usize> + Send;
-    type BlockRange<'a, R> = BoxStream<'a, QueryResult<BlockQueryData<Types>>>
+    type BlockRange<R> = BoxStream<'static, Fetch<BlockQueryData<Types>>>
     where
-        Self: 'a,
         R: RangeBounds<usize> + Send;
 
-    async fn get_leaf<ID>(&self, id: ID) -> QueryResult<LeafQueryData<Types, I>>
+    async fn get_leaf<ID>(&self, id: ID) -> Fetch<LeafQueryData<Types, I>>
     where
         ID: Into<LeafId<Types, I>> + Send + Sync,
     {
         let n = match id.into() {
             ResourceId::Number(n) => n,
-            ResourceId::Hash(h) => {
-                *self.index_by_leaf_hash.get(&h).context(NotFoundSnafu)? as usize
-            }
+            ResourceId::Hash(h) => *self.index_by_leaf_hash.get(&h).expect("TODO FETCH") as usize,
         };
-        self.leaf_storage
-            .iter()
-            .nth(n)
-            .context(NotFoundSnafu)?
-            .context(MissingSnafu)
+        Fetch::Ready(
+            self.leaf_storage
+                .iter()
+                .nth(n)
+                .expect("TODO FETCH")
+                .expect("TODO FETCH"),
+        )
     }
 
-    async fn get_block<ID>(&self, id: ID) -> QueryResult<BlockQueryData<Types>>
+    async fn get_block<ID>(&self, id: ID) -> Fetch<BlockQueryData<Types>>
     where
         ID: Into<BlockId<Types>> + Send + Sync,
     {
         let n = match id.into() {
             ResourceId::Number(n) => n,
-            ResourceId::Hash(h) => {
-                *self.index_by_block_hash.get(&h).context(NotFoundSnafu)? as usize
-            }
+            ResourceId::Hash(h) => *self.index_by_block_hash.get(&h).expect("TODO FETCH") as usize,
         };
-        self.block_storage
-            .iter()
-            .nth(n)
-            .context(NotFoundSnafu)?
-            .context(MissingSnafu)
+        Fetch::Ready(
+            self.block_storage
+                .iter()
+                .nth(n)
+                .expect("TODO FETCH")
+                .expect("TODO FETCH"),
+        )
     }
 
-    async fn get_leaf_range<R>(&self, range: R) -> QueryResult<Self::LeafRange<'_, R>>
+    async fn get_leaf_range<R>(&self, range: R) -> Self::LeafRange<R>
     where
-        R: RangeBounds<usize> + Send,
+        R: RangeBounds<usize> + Send + 'static,
     {
-        Ok(range_stream(self.leaf_storage.iter(), range).await.boxed())
+        range_stream(self.leaf_storage.iter(), range).await.boxed()
     }
 
-    async fn get_block_range<R>(&self, range: R) -> QueryResult<Self::BlockRange<'_, R>>
+    async fn get_block_range<R>(&self, range: R) -> Self::BlockRange<R>
     where
-        R: RangeBounds<usize> + Send,
+        R: RangeBounds<usize> + Send + 'static,
     {
-        Ok(range_stream(self.block_storage.iter(), range).await.boxed())
+        range_stream(self.block_storage.iter(), range).await.boxed()
     }
 
     async fn get_block_with_transaction(
         &self,
         hash: TransactionHash<Types>,
-    ) -> QueryResult<(BlockQueryData<Types>, TransactionIndex<Types>)> {
-        let (height, ix) = self.index_by_txn_hash.get(&hash).context(NotFoundSnafu)?;
-        let block = self.get_block(*height as usize).await?;
-        Ok((block, ix.clone()))
-    }
-
-    async fn get_proposals(
-        &self,
-        id: &EncodedPublicKey,
-        limit: Option<usize>,
-    ) -> QueryResult<Vec<LeafQueryData<Types, I>>> {
-        let all_ids = self
-            .index_by_proposer_id
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
-        let start_from = match limit {
-            Some(count) => all_ids.len().saturating_sub(count),
-            None => 0,
-        };
-        stream::iter(all_ids)
-            .skip(start_from)
-            .then(|height| self.get_leaf(height as usize))
-            .try_collect()
+    ) -> Fetch<(BlockQueryData<Types>, TransactionIndex<Types>)> {
+        let (height, ix) = self.index_by_txn_hash.get(&hash).expect("TODO FETCH");
+        let ix = ix.clone();
+        self.get_block(*height as usize)
             .await
-    }
-
-    async fn count_proposals(&self, id: &EncodedPublicKey) -> QueryResult<usize> {
-        Ok(match self.index_by_proposer_id.get(id) {
-            Some(ids) => ids.len(),
-            None => 0,
-        })
-    }
-
-    async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> {
-        Ok(self
-            .leaf_storage
-            .subscribe(height)
-            .context(MissingSnafu)?
-            .map(Ok)
-            .boxed())
-    }
-
-    async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
-        Ok(self
-            .block_storage
-            .subscribe(height)
-            .context(MissingSnafu)?
-            .map(Ok)
-            .boxed())
+            .map(|block| (block, ix))
     }
 }
 
@@ -558,13 +513,43 @@ fn update_index_by_hash<H: Eq + Hash, P: Ord>(index: &mut HashMap<H, P>, hash: H
 }
 
 #[async_trait]
-impl<Types: NodeType, I: NodeImplementation<Types>> StatusDataSource
+impl<Types: NodeType, I: NodeImplementation<Types>> StatusDataSource<Types, I>
     for FileSystemDataSource<Types, I>
 where
     Block<Types>: QueryableBlock,
 {
     async fn block_height(&self) -> QueryResult<usize> {
         Ok(self.leaf_storage.iter().len())
+    }
+
+    async fn get_proposals(
+        &self,
+        id: &EncodedPublicKey,
+        limit: Option<usize>,
+    ) -> QueryResult<Vec<LeafQueryData<Types, I>>> {
+        let all_ids = self
+            .index_by_proposer_id
+            .get(id)
+            .cloned()
+            .unwrap_or_default();
+        let start_from = match limit {
+            Some(count) => all_ids.len().saturating_sub(count),
+            None => 0,
+        };
+        stream::iter(all_ids)
+            .skip(start_from)
+            .then(
+                |height| async move { self.get_leaf(height as usize).await.context(MissingSnafu) },
+            )
+            .try_collect()
+            .await
+    }
+
+    async fn count_proposals(&self, id: &EncodedPublicKey) -> QueryResult<usize> {
+        Ok(match self.index_by_proposer_id.get(id) {
+            Some(ids) => ids.len(),
+            None => 0,
+        })
     }
 
     fn metrics(&self) -> &PrometheusMetrics {

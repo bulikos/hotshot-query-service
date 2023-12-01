@@ -12,16 +12,16 @@
 
 #![cfg(feature = "sql-data-source")]
 
-use super::{buffered_channel::BufferedChannel, VersionedDataSource};
+use super::VersionedDataSource;
 use crate::{
     availability::{
-        AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData, ResourceId,
+        AvailabilityDataSource, BlockId, BlockQueryData, Fetch, LeafId, LeafQueryData, ResourceId,
         TransactionHash, TransactionIndex, UpdateAvailabilityData,
     },
     metrics::PrometheusMetrics,
     status::StatusDataSource,
-    Block, Deltas, Leaf, MissingSnafu, NotFoundSnafu, QueryError, QueryResult, QueryableBlock,
-    QuorumCertificate, Resolvable,
+    Block, Deltas, Leaf, MissingSnafu, QueryError, QueryResult, QueryableBlock, QuorumCertificate,
+    Resolvable,
 };
 use async_std::{net::ToSocketAddrs, task::spawn};
 use async_trait::async_trait;
@@ -38,7 +38,6 @@ use hotshot_types::traits::{
     signature_key::EncodedPublicKey,
 };
 use itertools::Itertools;
-use snafu::OptionExt;
 use std::{
     ops::{Bound, RangeBounds},
     pin::Pin,
@@ -248,12 +247,7 @@ impl Config {
     }
 
     /// Connect to the database with this config.
-    pub async fn connect<Types, I>(self) -> Result<SqlDataSource<Types, I>, Error>
-    where
-        Types: NodeType,
-        I: NodeImplementation<Types>,
-        Block<Types>: QueryableBlock,
-    {
+    pub async fn connect(self) -> Result<SqlDataSource, Error> {
         SqlDataSource::connect(self).await
     }
 }
@@ -391,7 +385,7 @@ impl Config {
 /// # async fn doc(config: Config) -> Result<(), Error> {
 /// type AppState = &'static str;
 ///
-/// let data_source: ExtensibleDataSource<SqlDataSource<AppTypes, AppNodeImpl>, AppState> =
+/// let data_source: ExtensibleDataSource<SqlDataSource, AppState> =
 ///     ExtensibleDataSource::new(SqlDataSource::connect(config).await?, "app state");
 /// # Ok(())
 /// # }
@@ -443,7 +437,7 @@ impl Config {
 /// # };
 /// # use tide_disco::App;
 /// struct AppState {
-///     hotshot_qs: SqlDataSource<AppTypes, AppNodeImpl>,
+///     hotshot_qs: SqlDataSource,
 ///     // additional state for other modules
 /// }
 ///
@@ -483,26 +477,14 @@ impl Config {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct SqlDataSource<Types, I>
-where
-    Types: NodeType,
-    I: NodeImplementation<Types>,
-    Block<Types>: QueryableBlock,
-{
+pub struct SqlDataSource {
     client: Client,
     tx_in_progress: bool,
-    leaf_stream: BufferedChannel<LeafQueryData<Types, I>>,
-    block_stream: BufferedChannel<BlockQueryData<Types>>,
     metrics: PrometheusMetrics,
     kill: Option<oneshot::Sender<()>>,
 }
 
-impl<Types, I> SqlDataSource<Types, I>
-where
-    Types: NodeType,
-    I: NodeImplementation<Types>,
-    Block<Types>: QueryableBlock,
-{
+impl SqlDataSource {
     /// Connect to a remote database.
     pub async fn connect(mut config: Config) -> Result<Self, Error> {
         // Establish a TCP connection to the server.
@@ -570,8 +552,6 @@ where
             client,
             tx_in_progress: false,
             kill: Some(kill),
-            leaf_stream: BufferedChannel::init(),
-            block_stream: BufferedChannel::init(),
             metrics: Default::default(),
         })
     }
@@ -607,12 +587,7 @@ where
     }
 }
 
-impl<Types, I> Drop for SqlDataSource<Types, I>
-where
-    Types: NodeType,
-    I: NodeImplementation<Types>,
-    Block<Types>: QueryableBlock,
-{
+impl Drop for SqlDataSource {
     fn drop(&mut self) {
         if let Some(kill) = self.kill.take() {
             // Ignore errors, they just mean the task has already exited.
@@ -622,12 +597,7 @@ where
 }
 
 #[async_trait]
-impl<Types, I> VersionedDataSource for SqlDataSource<Types, I>
-where
-    Types: NodeType,
-    I: NodeImplementation<Types>,
-    Block<Types>: QueryableBlock,
-{
+impl VersionedDataSource for SqlDataSource {
     type Error = postgres::error::Error;
 
     /// Atomically commit to all outstanding modifications to the data.
@@ -639,8 +609,6 @@ where
             self.client.batch_execute("COMMIT").await?;
             self.tx_in_progress = false;
         }
-        self.leaf_stream.flush().await;
-        self.block_stream.flush().await;
         Ok(())
     }
 
@@ -659,31 +627,24 @@ where
                 .expect("DB rollback succeeds");
             self.tx_in_progress = false;
         }
-        self.leaf_stream.clear();
-        self.block_stream.clear();
     }
 }
 
 #[async_trait]
-impl<Types, I> AvailabilityDataSource<Types, I> for SqlDataSource<Types, I>
+impl<Types, I> AvailabilityDataSource<Types, I> for SqlDataSource
 where
     Types: NodeType,
     I: NodeImplementation<Types>,
     Block<Types>: QueryableBlock,
 {
-    type LeafStream = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>;
-    type BlockStream = BoxStream<'static, QueryResult<BlockQueryData<Types>>>;
-
-    type LeafRange<'a, R> = BoxStream<'static, QueryResult<LeafQueryData<Types, I>>>
+    type LeafRange<R> = BoxStream<'static, Fetch<LeafQueryData<Types, I>>>
     where
-        Self: 'a,
         R: RangeBounds<usize> + Send;
-    type BlockRange<'a, R>= BoxStream<'static, QueryResult<BlockQueryData<Types>>>
+    type BlockRange<R>= BoxStream<'static, Fetch<BlockQueryData<Types>>>
     where
-        Self: 'a,
         R: RangeBounds<usize> + Send;
 
-    async fn get_leaf<ID>(&self, id: ID) -> QueryResult<LeafQueryData<Types, I>>
+    async fn get_leaf<ID>(&self, id: ID) -> Fetch<LeafQueryData<Types, I>>
     where
         ID: Into<LeafId<Types, I>> + Send + Sync,
     {
@@ -696,14 +657,12 @@ where
             .client
             .query_opt(&query, &[&*param])
             .await
-            .map_err(|err| QueryError::Error {
-                message: err.to_string(),
-            })?
-            .context(NotFoundSnafu)?;
+            .expect("TODO FETCH")
+            .expect("TODO FETCH");
         parse_leaf(row)
     }
 
-    async fn get_block<ID>(&self, id: ID) -> QueryResult<BlockQueryData<Types>>
+    async fn get_block<ID>(&self, id: ID) -> Fetch<BlockQueryData<Types>>
     where
         ID: Into<BlockId<Types>> + Send + Sync,
     {
@@ -726,39 +685,29 @@ where
             .client
             .query_opt(&query, &[&*param])
             .await
-            .map_err(|err| QueryError::Error {
-                message: err.to_string(),
-            })?
-            .context(NotFoundSnafu)?;
+            .expect("TODO FETCH")
+            .expect("TODO FETCH");
         parse_block(row)
     }
 
-    async fn get_leaf_range<R>(&self, range: R) -> QueryResult<Self::LeafRange<'_, R>>
+    async fn get_leaf_range<R>(&self, range: R) -> Self::LeafRange<R>
     where
-        R: RangeBounds<usize> + Send,
+        R: RangeBounds<usize> + Send + 'static,
     {
         let (where_clause, params) = bounds_to_where_clause(range, "height");
         let query = format!("SELECT leaf, qc FROM leaf {where_clause} ORDER BY height ASC");
-        let rows =
-            self.client
-                .query_raw(&query, params)
-                .await
-                .map_err(|err| QueryError::Error {
-                    message: err.to_string(),
-                })?;
+        let rows = self
+            .client
+            .query_raw(&query, params)
+            .await
+            .expect("TODO FETCH");
 
-        Ok(rows
-            .map(|res| {
-                parse_leaf(res.map_err(|err| QueryError::Error {
-                    message: err.to_string(),
-                })?)
-            })
-            .boxed())
+        rows.map(|res| parse_leaf(res.expect("TODO FETCH"))).boxed()
     }
 
-    async fn get_block_range<R>(&self, range: R) -> QueryResult<Self::BlockRange<'_, R>>
+    async fn get_block_range<R>(&self, range: R) -> Self::BlockRange<R>
     where
-        R: RangeBounds<usize> + Send,
+        R: RangeBounds<usize> + Send + 'static,
     {
         let (where_clause, params) = bounds_to_where_clause(range, "h.height");
         let query = format!(
@@ -768,27 +717,20 @@ where
               {where_clause}
               ORDER BY h.height ASC"
         );
-        let rows =
-            self.client
-                .query_raw(&query, params)
-                .await
-                .map_err(|err| QueryError::Error {
-                    message: err.to_string(),
-                })?;
+        let rows = self
+            .client
+            .query_raw(&query, params)
+            .await
+            .expect("TODO FETCH");
 
-        Ok(rows
-            .map(|res| {
-                parse_block(res.map_err(|err| QueryError::Error {
-                    message: err.to_string(),
-                })?)
-            })
-            .boxed())
+        rows.map(|res| parse_block(res.expect("TODO FETCH")))
+            .boxed()
     }
 
     async fn get_block_with_transaction(
         &self,
         hash: TransactionHash<Types>,
-    ) -> QueryResult<(BlockQueryData<Types>, TransactionIndex<Types>)> {
+    ) -> Fetch<(BlockQueryData<Types>, TransactionIndex<Types>)> {
         // ORDER BY t.id ASC ensures that if there are duplicate transactions, we return the first
         // one.
         let query = format!(
@@ -804,94 +746,20 @@ where
             .client
             .query_opt(&query, &[&hash.to_string()])
             .await
-            .map_err(|err| QueryError::Error {
-                message: err.to_string(),
-            })?
-            .context(NotFoundSnafu)?;
+            .expect("TODO FETCH")
+            .expect("TODO FETCH");
 
         // Extract the transaction index.
-        let index = row.try_get("tx_index").map_err(|err| QueryError::Error {
-            message: format!("error extracting transaction index from query results: {err}"),
-        })?;
-        let index: TransactionIndex<Types> =
-            serde_json::from_value(index).map_err(|err| QueryError::Error {
-                message: format!("malformed transaction index: {err}"),
-            })?;
+        let index = row.try_get("tx_index").expect("TODO FETCH");
+        let index: TransactionIndex<Types> = serde_json::from_value(index).expect("TODO FETCH");
 
         // Extract the block.
-        let block = parse_block(row)?;
-
-        Ok((block, index))
-    }
-
-    async fn get_proposals(
-        &self,
-        proposer: &EncodedPublicKey,
-        limit: Option<usize>,
-    ) -> QueryResult<Vec<LeafQueryData<Types, I>>> {
-        let mut query = "SELECT leaf, qc FROM leaf WHERE proposer = $1".to_owned();
-        if let Some(limit) = limit {
-            // If there is a limit on the number of leaves to return, we want to return the most
-            // recent leaves, so order by descending height.
-            query = format!("{query} ORDER BY height DESC limit {limit}");
-        }
-        let rows = self
-            .client
-            .query_raw(&query, &[&proposer.to_string()])
-            .await
-            .map_err(|err| QueryError::Error {
-                message: err.to_string(),
-            })?;
-        let mut leaves: Vec<_> = rows
-            .map(|res| {
-                parse_leaf(res.map_err(|err| QueryError::Error {
-                    message: err.to_string(),
-                })?)
-            })
-            .try_collect()
-            .await?;
-
-        if limit.is_some() {
-            // If there was a limit, we selected the leaves in descending order to get the most
-            // recent leaves. Now reverse them to put them back in chronological order.
-            leaves.reverse();
-        }
-
-        Ok(leaves)
-    }
-
-    async fn count_proposals(&self, proposer: &EncodedPublicKey) -> QueryResult<usize> {
-        let query = "SELECT count(*) FROM leaf WHERE proposer = $1";
-        let row = self
-            .client
-            .query_one(query, &[&proposer.to_string()])
-            .await
-            .map_err(|err| QueryError::Error {
-                message: err.to_string(),
-            })?;
-        let count: i64 = row.get(0);
-        Ok(count as usize)
-    }
-
-    async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> {
-        // Fetch leaves above `height` which have already been produced.
-        let current_leaves = self.get_leaf_range(height..).await?;
-        // Subscribe to future leaves after that.
-        let future_leaves = self.leaf_stream.subscribe().await.map(Ok);
-        Ok(current_leaves.chain(future_leaves).boxed())
-    }
-
-    async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
-        // Fetch blocks above `height` which have already been produced.
-        let current_blocks = self.get_block_range(height..).await?;
-        // Subscribe to future blocks after that.
-        let future_blocks = self.block_stream.subscribe().await.map(Ok);
-        Ok(current_blocks.chain(future_blocks).boxed())
+        parse_block(row).map(|block| (block, index))
     }
 }
 
 #[async_trait]
-impl<Types, I> UpdateAvailabilityData<Types, I> for SqlDataSource<Types, I>
+impl<Types, I> UpdateAvailabilityData<Types, I> for SqlDataSource
 where
     Types: NodeType,
     I: NodeImplementation<Types>,
@@ -959,7 +827,6 @@ where
                 message: err.to_string(),
             })?;
 
-        self.leaf_stream.push(leaf);
         Ok(())
     }
 
@@ -1016,17 +883,15 @@ where
                 message: err.to_string(),
             })?;
 
-        self.block_stream.push(block);
         Ok(())
     }
 }
 
 #[async_trait]
-impl<Types, I> StatusDataSource for SqlDataSource<Types, I>
+impl<Types, I> StatusDataSource<Types, I> for SqlDataSource
 where
     Types: NodeType,
     I: NodeImplementation<Types>,
-    Block<Types>: QueryableBlock,
 {
     async fn block_height(&self) -> QueryResult<usize> {
         let query = "SELECT max(height) FROM header";
@@ -1049,6 +914,56 @@ where
                 Ok(0)
             }
         }
+    }
+
+    async fn get_proposals(
+        &self,
+        proposer: &EncodedPublicKey,
+        limit: Option<usize>,
+    ) -> QueryResult<Vec<LeafQueryData<Types, I>>> {
+        let mut query = "SELECT leaf, qc FROM leaf WHERE proposer = $1".to_owned();
+        if let Some(limit) = limit {
+            // If there is a limit on the number of leaves to return, we want to return the most
+            // recent leaves, so order by descending height.
+            query = format!("{query} ORDER BY height DESC limit {limit}");
+        }
+        let rows = self
+            .client
+            .query_raw(&query, &[&proposer.to_string()])
+            .await
+            .map_err(|err| QueryError::Error {
+                message: err.to_string(),
+            })?;
+        let mut leaves: Vec<_> = rows
+            .map(|res| {
+                parse_leaf(res.map_err(|err| QueryError::Error {
+                    message: err.to_string(),
+                })?)
+                .context(MissingSnafu)
+            })
+            .try_collect()
+            .await?;
+
+        if limit.is_some() {
+            // If there was a limit, we selected the leaves in descending order to get the most
+            // recent leaves. Now reverse them to put them back in chronological order.
+            leaves.reverse();
+        }
+
+        Ok(leaves)
+    }
+
+    async fn count_proposals(&self, proposer: &EncodedPublicKey) -> QueryResult<usize> {
+        let query = "SELECT count(*) FROM leaf WHERE proposer = $1";
+        let row = self
+            .client
+            .query_one(query, &[&proposer.to_string()])
+            .await
+            .map_err(|err| QueryError::Error {
+                message: err.to_string(),
+            })?;
+        let count: i64 = row.get(0);
+        Ok(count as usize)
     }
 
     fn metrics(&self) -> &PrometheusMetrics {
@@ -1118,72 +1033,45 @@ impl<'a> Transaction<'a> {
     }
 }
 
-fn parse_leaf<Types, I>(row: Row) -> QueryResult<LeafQueryData<Types, I>>
+fn parse_leaf<Types, I>(row: Row) -> Fetch<LeafQueryData<Types, I>>
 where
     Types: NodeType,
     I: NodeImplementation<Types>,
 {
-    let leaf = row.try_get("leaf").map_err(|err| QueryError::Error {
-        message: format!("error extracting leaf from query results: {err}"),
-    })?;
-    let leaf: Leaf<Types, I> = serde_json::from_value(leaf).map_err(|err| QueryError::Error {
-        message: format!("malformed leaf: {err}"),
-    })?;
+    let leaf = row.try_get("leaf").expect("TODO FETCH");
+    let leaf: Leaf<Types, I> = serde_json::from_value(leaf).expect("TODO FETCH");
 
-    let qc = row.try_get("qc").map_err(|err| QueryError::Error {
-        message: format!("error extracting QC from query results: {err}"),
-    })?;
-    let qc: QuorumCertificate<Types, I> =
-        serde_json::from_value(qc).map_err(|err| QueryError::Error {
-            message: format!("malformed QC: {err}"),
-        })?;
+    let qc = row.try_get("qc").expect("TODO FETCH");
+    let qc: QuorumCertificate<Types, I> = serde_json::from_value(qc).expect("TODO FETCH");
 
-    Ok(LeafQueryData { leaf, qc })
+    Fetch::Ready(LeafQueryData { leaf, qc })
 }
 
 const BLOCK_COLUMNS: &str = "h.hash AS hash, h.height AS height, h.timestamp AS timestamp, p.size AS payload_size, p.data AS payload_data";
 
-fn parse_block<Types>(row: Row) -> QueryResult<BlockQueryData<Types>>
+fn parse_block<Types>(row: Row) -> Fetch<BlockQueryData<Types>>
 where
     Types: NodeType,
     Block<Types>: QueryableBlock,
 {
     // First, check if we have the payload for this block yet.
-    let size: Option<i32> = row
-        .try_get("payload_size")
-        .map_err(|err| QueryError::Error {
-            message: format!("error extracting payload size from query results: {err}"),
-        })?;
-    let data: Option<Vec<u8>> = row
-        .try_get("payload_data")
-        .map_err(|err| QueryError::Error {
-            message: format!("error extracting payload data from query results: {err}"),
-        })?;
-    let (size, data) = size.zip(data).context(MissingSnafu)?;
+    let size: Option<i32> = row.try_get("payload_size").expect("TODO FETCH");
+    let data: Option<Vec<u8>> = row.try_get("payload_data").expect("TODO FETCH");
+    let (size, data) = size.zip(data).expect("TODO FETCH");
     let size = size as u64;
 
     // Reconstruct the full block.
-    let block = bincode::deserialize(&data).map_err(|err| QueryError::Error {
-        message: format!("malformed payload data: {err}"),
-    })?;
+    let block = bincode::deserialize(&data).expect("TODO FETCH");
 
     // Reconstruct the query data by adding metadata.
-    let hash: String = row.try_get("hash").map_err(|err| QueryError::Error {
-        message: format!("error extracting block hash from query results: {err}"),
-    })?;
-    let hash = hash.parse().map_err(|err| QueryError::Error {
-        message: format!("malformed block hash: {err}"),
-    })?;
-    let height: i64 = row.try_get("height").map_err(|err| QueryError::Error {
-        message: format!("error extracting block height from query results: {err}"),
-    })?;
+    let hash: String = row.try_get("hash").expect("TODO FETCH");
+    let hash = hash.parse().expect("TODO FETCH");
+    let height: i64 = row.try_get("height").expect("TODO FETCH");
     let height = height as u64;
-    let timestamp: OffsetDateTime = row.try_get("timestamp").map_err(|err| QueryError::Error {
-        message: format!("error extracting block height from query results: {err}"),
-    })?;
+    let timestamp: OffsetDateTime = row.try_get("timestamp").expect("TODO FETCH");
     let timestamp = timestamp.unix_timestamp_nanos();
 
-    Ok(BlockQueryData {
+    Fetch::Ready(BlockQueryData {
         block,
         size,
         hash,
@@ -1305,10 +1193,7 @@ impl tokio::io::AsyncWrite for TcpStream {
 #[cfg(all(any(test, feature = "testing"), not(target_os = "windows")))]
 pub mod testing {
     use super::*;
-    use crate::testing::{
-        mocks::{MockNodeImpl, MockTypes, TestableDataSource},
-        sleep,
-    };
+    use crate::testing::{mocks::TestableDataSource, sleep};
     use portpicker::pick_unused_port;
     use std::{
         process::{Command, Stdio},
@@ -1400,7 +1285,7 @@ pub mod testing {
     }
 
     #[async_trait]
-    impl TestableDataSource for SqlDataSource<MockTypes, MockNodeImpl> {
+    impl TestableDataSource for SqlDataSource {
         type Storage = TmpDb;
 
         async fn create(_node_id: usize) -> Self::Storage {
@@ -1424,23 +1309,19 @@ pub mod testing {
 mod generic_test {
     use super::super::data_source_tests;
     use super::SqlDataSource;
-    use crate::testing::mocks::{MockNodeImpl, MockTypes};
 
     // For some reason this is the only way to import the macro defined in another module of this
     // crate.
     use crate::*;
 
-    instantiate_data_source_tests!(SqlDataSource<MockTypes, MockNodeImpl>);
+    instantiate_data_source_tests!(SqlDataSource);
 }
 
 // These tests run the `postgres` Docker image, which doesn't work on Windows.
 #[cfg(all(test, not(target_os = "windows")))]
 mod test {
     use super::{testing::TmpDb, *};
-    use crate::testing::{
-        mocks::{MockNodeImpl, MockTypes},
-        setup_test,
-    };
+    use crate::testing::setup_test;
 
     #[async_std::test]
     async fn test_migrations() {
@@ -1458,7 +1339,7 @@ mod test {
             if !migrations {
                 cfg = cfg.no_migrations();
             }
-            let client: SqlDataSource<MockTypes, MockNodeImpl> = cfg.connect().await?;
+            let client = cfg.connect().await?;
             Ok::<_, Error>(client)
         };
 

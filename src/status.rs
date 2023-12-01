@@ -10,12 +10,24 @@
 // You should have received a copy of the GNU General Public License along with this program. If not,
 // see <https://www.gnu.org/licenses/>.
 
-use crate::api::load_api;
+//! Queries for evolving and node-specific data.
+//!
+//! This API module defines a query API which complements the queries provided by the
+//! [availability](crate::availability) module. While the availability module provides only data
+//! which is immutable and which has global agreement across consensus, this module provides insight
+//! into data and metrics which are constantly changing. It also surfaces information from the point
+//! of view of a particular HotShot node, which other nodes may not agree on or even know about.
+
+use crate::{api::load_api, QueryError};
 use clap::Args;
 use derive_more::From;
 use futures::FutureExt;
+use hotshot_types::traits::{
+    node_implementation::{NodeImplementation, NodeType},
+    signature_key::EncodedPublicKey,
+};
 use serde::{Deserialize, Serialize};
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::fmt::Display;
 use std::path::PathBuf;
 use tide_disco::{api::ApiError, method::ReadState, Api, RequestError, StatusCode};
@@ -44,14 +56,27 @@ pub struct Options {
 
 #[derive(Clone, Debug, From, Snafu, Deserialize, Serialize)]
 pub enum Error {
-    Request { source: RequestError },
-    Internal { reason: String },
+    Request {
+        source: RequestError,
+    },
+
+    #[snafu(display("error fetching proposals by {proposer}: {source}"))]
+    #[from(ignore)]
+    QueryProposals {
+        source: QueryError,
+        proposer: EncodedPublicKey,
+    },
+
+    Internal {
+        reason: String,
+    },
 }
 
 impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Request { .. } => StatusCode::BadRequest,
+            Self::QueryProposals { source, .. } => source.status(),
             Self::Internal { .. } => StatusCode::InternalServerError,
         }
     }
@@ -63,10 +88,12 @@ fn internal<M: Display>(msg: M) -> Error {
     }
 }
 
-pub fn define_api<State>(options: &Options) -> Result<Api<State, Error>, ApiError>
+pub fn define_api<State, Types, I>(options: &Options) -> Result<Api<State, Error>, ApiError>
 where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
     State: 'static + Send + Sync + ReadState,
-    <State as ReadState>::State: Send + Sync + StatusDataSource,
+    <State as ReadState>::State: Send + Sync + StatusDataSource<Types, I>,
 {
     let mut api = load_api::<State, Error>(
         options.api_path.as_ref(),
@@ -76,6 +103,27 @@ where
     api.with_version("0.0.1".parse().unwrap())
         .get("latest_block_height", |_, state| {
             async { state.block_height().await.map_err(internal) }.boxed()
+        })?
+        .get("count_proposals", |req, state| {
+            async move {
+                let proposer = req.blob_param("proposer_id")?;
+                state
+                    .count_proposals(&proposer)
+                    .await
+                    .context(QueryProposalsSnafu { proposer })
+            }
+            .boxed()
+        })?
+        .get("get_proposals", |req, state| {
+            async move {
+                let proposer = req.blob_param("proposer_id")?;
+                let limit = req.opt_integer_param("count")?;
+                state
+                    .get_proposals(&proposer, limit)
+                    .await
+                    .context(QueryProposalsSnafu { proposer })
+            }
+            .boxed()
         })?
         .get("mempool_info", |_, state| {
             async { state.mempool_info().await.map_err(internal) }.boxed()
@@ -246,6 +294,8 @@ mod test {
 
         let mut api = define_api::<
             RwLock<ExtensibleDataSource<FileSystemDataSource<MockTypes, MockNodeImpl>, u64>>,
+            MockTypes,
+            MockNodeImpl,
         >(&Options {
             extensions: vec![extensions.into()],
             ..Default::default()

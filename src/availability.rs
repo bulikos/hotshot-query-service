@@ -10,23 +10,29 @@
 // You should have received a copy of the GNU General Public License along with this program. If not,
 // see <https://www.gnu.org/licenses/>.
 
-use crate::{api::load_api, Block, QueryError};
+//! Queries for normative, immutable consensus data.
+//!
+//! This API module defines a query API for all of the data which is guaranteed available by HotShot
+//! consensus. All of the data [provided here](AvailabilityDataSource) is _normative_: every correct
+//! HotShot node or light client will agree on it, and it is guaranteed by consensus to remain
+//! immutable once available.
+
+use crate::{api::load_api, Block};
 use clap::Args;
 use derive_more::From;
 use futures::{FutureExt, StreamExt, TryFutureExt};
-use hotshot_types::traits::{
-    node_implementation::{NodeImplementation, NodeType},
-    signature_key::EncodedPublicKey,
-};
+use hotshot_types::traits::node_implementation::{NodeImplementation, NodeType};
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{OptionExt, Snafu};
 use std::fmt::Display;
 use std::path::PathBuf;
 use tide_disco::{api::ApiError, method::ReadState, Api, RequestError, StatusCode};
 
 pub(crate) mod data_source;
+mod fetch;
 pub(crate) mod query_data;
 pub use data_source::*;
+pub use fetch::Fetch;
 pub use query_data::*;
 
 #[derive(Args, Default)]
@@ -52,39 +58,20 @@ pub enum Error {
     Request {
         source: RequestError,
     },
-    #[snafu(display("error fetching leaf {resource}: {source}"))]
+    #[snafu(display("error fetching leaf {resource}"))]
     #[from(ignore)]
-    QueryLeaf {
-        source: QueryError,
+    FetchLeaf {
         resource: String,
     },
-    #[snafu(display("error streaming leaves: {source}"))]
+    #[snafu(display("error fetching block {resource}"))]
     #[from(ignore)]
-    StreamLeaf {
-        source: QueryError,
-    },
-    #[snafu(display("error fetching block {resource}: {source}"))]
-    #[from(ignore)]
-    QueryBlock {
-        source: QueryError,
+    FetchBlock {
         resource: String,
     },
-    #[snafu(display("error streaming blocks: {source}"))]
+    #[snafu(display("error fetching transaction {resource}"))]
     #[from(ignore)]
-    StreamBlock {
-        source: QueryError,
-    },
-    #[snafu(display("error fetching transaction {resource}: {source}"))]
-    #[from(ignore)]
-    QueryTransaction {
-        source: QueryError,
+    FetchTransaction {
         resource: String,
-    },
-    #[snafu(display("error fetching proposals by {proposer}: {source}"))]
-    #[from(ignore)]
-    QueryProposals {
-        source: QueryError,
-        proposer: EncodedPublicKey,
     },
     #[snafu(display("transaction index {index} out of range for block {height}"))]
     #[from(ignore)]
@@ -121,12 +108,9 @@ impl Error {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::Request { .. } => StatusCode::BadRequest,
-            Self::QueryLeaf { source, .. }
-            | Self::StreamLeaf { source, .. }
-            | Self::QueryBlock { source, .. }
-            | Self::StreamBlock { source, .. }
-            | Self::QueryTransaction { source, .. }
-            | Self::QueryProposals { source, .. } => source.status(),
+            Self::FetchLeaf { .. } | Self::FetchBlock { .. } | Self::FetchTransaction { .. } => {
+                StatusCode::NotFound
+            }
             Self::InvalidTransactionIndex { .. } => StatusCode::NotFound,
             Self::LeafStream { .. } | Self::BlockStream { .. } => StatusCode::InternalServerError,
             Self::Custom { status, .. } => *status,
@@ -154,7 +138,7 @@ where
                     Some(height) => ResourceId::Number(height),
                     None => ResourceId::Hash(req.blob_param("hash")?),
                 };
-                state.get_leaf(id).await.context(QueryLeafSnafu {
+                state.get_leaf(id).await.context(FetchLeafSnafu {
                     resource: id.to_string(),
                 })
             }
@@ -165,17 +149,7 @@ where
                 let height = req.integer_param("height")?;
                 state
                     .read(|state| {
-                        async move {
-                            Ok(state
-                                .subscribe_leaves(height)
-                                .await
-                                .map_err(|err| Error::LeafStream {
-                                    height: height as u64,
-                                    reason: err.to_string(),
-                                })?
-                                .map(Ok))
-                        }
-                        .boxed()
+                        async move { Ok(state.subscribe_leaves(height).await.map(Ok)) }.boxed()
                     })
                     .await
             }
@@ -191,11 +165,7 @@ where
                             Ok(state
                                 .subscribe_blocks(height)
                                 .await
-                                .map_err(|err| Error::LeafStream {
-                                    height: height as u64,
-                                    reason: err.to_string(),
-                                })?
-                                .map(|block| Ok(block.context(StreamBlockSnafu)?.header())))
+                                .map(|block| Ok(block.header())))
                         }
                         .boxed()
                     })
@@ -210,7 +180,7 @@ where
                     Some(height) => ResourceId::Number(height),
                     None => ResourceId::Hash(req.blob_param("hash")?),
                 };
-                state.get_block(id).await.context(QueryBlockSnafu {
+                state.get_block(id).await.context(FetchBlockSnafu {
                     resource: id.to_string(),
                 })
             }
@@ -221,17 +191,7 @@ where
                 let height = req.integer_param("height")?;
                 state
                     .read(|state| {
-                        async move {
-                            Ok(state
-                                .subscribe_blocks(height)
-                                .await
-                                .map_err(|err| Error::BlockStream {
-                                    height: height as u64,
-                                    reason: err.to_string(),
-                                })?
-                                .map(Ok))
-                        }
-                        .boxed()
+                        async move { Ok(state.subscribe_blocks(height).await.map(Ok)) }.boxed()
                     })
                     .await
             }
@@ -242,14 +202,14 @@ where
             async move {
                 let (block, index) = match req.opt_blob_param("hash")? {
                     Some(hash) => state.get_block_with_transaction(hash).await.context(
-                        QueryTransactionSnafu {
+                        FetchTransactionSnafu {
                             resource: hash.to_string(),
                         },
                     )?,
                     None => {
                         let height = req.integer_param("height")?;
                         let id = ResourceId::Number(height);
-                        let block = state.get_block(id).await.context(QueryBlockSnafu {
+                        let block = state.get_block(id).await.context(FetchBlockSnafu {
                             resource: id.to_string(),
                         })?;
                         let i = req.integer_param("index")?;
@@ -264,27 +224,6 @@ where
                     .transaction(&index)
                     // The computation of `index` above should ensure that it is a valid index.
                     .unwrap())
-            }
-            .boxed()
-        })?
-        .get("countproposals", |req, state| {
-            async move {
-                let proposer = req.blob_param("proposer_id")?;
-                state
-                    .count_proposals(&proposer)
-                    .await
-                    .context(QueryProposalsSnafu { proposer })
-            }
-            .boxed()
-        })?
-        .get("getproposals", |req, state| {
-            async move {
-                let proposer = req.blob_param("proposer_id")?;
-                let limit = req.opt_integer_param("count")?;
-                state
-                    .get_proposals(&proposer, limit)
-                    .await
-                    .context(QueryProposalsSnafu { proposer })
             }
             .boxed()
         })?;
@@ -340,11 +279,7 @@ mod test {
                     }
                 }
                 Err(Error::Availability {
-                    source:
-                        super::Error::QueryBlock {
-                            source: QueryError::NotFound,
-                            ..
-                        },
+                    source: super::Error::FetchBlock { .. },
                 }) => {
                     tracing::info!(
                         "found end of ledger at height {i}, non-empty blocks are {blocks:?}",

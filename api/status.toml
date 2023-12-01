@@ -21,6 +21,33 @@ DOC = """
 Get the height of the latest committed block.
 """
 
+[route.countproposals]
+PATH = ["proposals/:proposer_id/count"]
+":proposer_id" = "TaggedBase64"
+DOC = """
+Get the number of committed blocks proposed by `proposer_id`
+
+Returns
+```
+{
+    "count": Integer,
+}
+```
+
+"""
+
+[route.getproposals]
+PATH = ["proposals/:proposer_id", "proposals/:proposer_id/limit/:count"]
+":proposer_id" = "TaggedBase64"
+":count" = "Integer"
+DOC = """
+Get the leaf data of `:count` leaves from the proposer with `:proposer_id`, starting backwards from
+the most recent leaf from this proposer. If the proposer has proposed fewer leaves than `:count`,
+return all the leaves from the proposer.
+
+Returns a list of the objects returned by `/leaf`.
+"""
+
 [route.mempool_info]
 PATH = ["/mempool_info"]
 DOC = """

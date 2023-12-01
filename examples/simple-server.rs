@@ -25,18 +25,20 @@ use hotshot::{
         implementations::{MasterMap, MemoryCommChannel, MemoryNetwork, MemoryStorage},
         NodeImplementation,
     },
-    types::{SignatureKey, SystemContextHandle},
+    types::{Message, SignatureKey, SystemContextHandle},
     HotShotInitializer, SystemContext,
 };
 use hotshot_query_service::{
     data_source, run_standalone_service,
-    status::UpdateStatusData,
     testing::mocks::{MockBlock, MockMembership, MockNodeImpl, MockTypes, TestableDataSource},
     Error,
 };
 use hotshot_signature_key::bn254::{BN254Priv, BN254Pub};
 use hotshot_types::{
-    traits::{election::Membership, node_implementation::ExchangesType},
+    traits::{
+        election::Membership,
+        node_implementation::{ExchangesType, NodeType},
+    },
     ExecutionType, HotShotConfig,
 };
 use std::{num::NonZeroUsize, time::Duration};
@@ -55,7 +57,7 @@ struct Options {
 }
 
 #[cfg(not(target_os = "windows"))]
-type DataSource = data_source::SqlDataSource<MockTypes, MockNodeImpl>;
+type DataSource = data_source::SqlDataSource;
 
 // To use SqlDataSource, we need to run the `postgres` Docker image, which doesn't work on Windows.
 #[cfg(target_os = "windows")]
@@ -134,15 +136,13 @@ async fn init_consensus(
         .iter()
         .map(BN254Pub::from_private)
         .collect::<Vec<_>>();
-    let master_map = MasterMap::new();
-    let known_nodes_with_stake: Vec<<BN254Pub as SignatureKey>::StakeTableEntry> = pub_keys
+    let stake_table = pub_keys
         .iter()
-        .map(|pub_key| pub_key.get_stake_table_entry(1u64))
-        .collect();
+        .map(|key| key.get_stake_table_entry(1u64))
+        .collect::<Vec<_>>();
     let config = HotShotConfig {
-        total_nodes: NonZeroUsize::new(pub_keys.len()).unwrap(),
-        known_nodes: pub_keys.clone(),
-        known_nodes_with_stake: known_nodes_with_stake.clone(),
+        total_nodes: NonZeroUsize::new(stake_table.len()).unwrap(),
+        known_nodes: pub_keys,
         start_delay: 0,
         round_start_delay: 0,
         next_view_timeout: 10000,
@@ -154,52 +154,68 @@ async fn init_consensus(
         num_bootstrap: 0,
         execution_type: ExecutionType::Continuous,
         election_config: None,
-        da_committee_size: pub_keys.len(),
+        da_committee_size: stake_table.len(),
+        known_nodes_with_stake: stake_table,
     };
+    let master_map = MasterMap::new();
     join_all(priv_keys.into_iter().zip(data_sources).enumerate().map(
         |(node_id, (priv_key, data_source))| {
-            let pub_keys = pub_keys.clone();
-            let known_nodes_with_stake = known_nodes_with_stake.clone();
-            let config = config.clone();
-            let master_map = master_map.clone();
-            let election_config = MockMembership::default_election_config(pub_keys.len() as u64);
-
-            async move {
-                let network = Arc::new(MemoryNetwork::new(
-                    pub_keys[node_id],
-                    data_source.populate_metrics(),
-                    master_map.clone(),
-                    None,
-                ));
-                let consensus_channel = MemoryCommChannel::new(network.clone());
-                let da_channel = MemoryCommChannel::new(network.clone());
-                let view_sync_channel = MemoryCommChannel::new(network.clone());
-
-                let exchanges = <MockNodeImpl as NodeImplementation<MockTypes>>::Exchanges::create(
-                    known_nodes_with_stake.clone(),
-                    pub_keys.clone(),
-                    (election_config.clone(), election_config.clone()),
-                    (consensus_channel, view_sync_channel, da_channel),
-                    pub_keys[node_id],
-                    pub_keys[node_id].get_stake_table_entry(1u64),
-                    priv_key.clone(),
-                );
-
-                SystemContext::init(
-                    pub_keys[node_id],
-                    priv_key,
-                    node_id as u64,
-                    config,
-                    MemoryStorage::empty(),
-                    exchanges,
-                    HotShotInitializer::from_genesis(MockBlock::genesis()).unwrap(),
-                    data_source.populate_metrics(),
-                )
-                .await
-                .unwrap()
-                .0
-            }
+            init_node(
+                node_id,
+                priv_key,
+                data_source,
+                config.clone(),
+                master_map.clone(),
+            )
         },
     ))
     .await
+}
+
+async fn init_node(
+    node_id: usize,
+    priv_key: BN254Priv,
+    data_source: &impl TestableDataSource,
+    config: HotShotConfig<
+        BN254Pub,
+        <BN254Pub as SignatureKey>::StakeTableEntry,
+        <MockTypes as NodeType>::ElectionConfigType,
+    >,
+    master_map: Arc<MasterMap<Message<MockTypes, MockNodeImpl>, BN254Pub>>,
+) -> SystemContextHandle<MockTypes, MockNodeImpl> {
+    let pub_key = BN254Pub::from_private(&priv_key);
+    let election_config = MockMembership::default_election_config(config.total_nodes.get() as u64);
+    let network = Arc::new(MemoryNetwork::new(
+        pub_key,
+        data_source.populate_metrics(),
+        master_map.clone(),
+        None,
+    ));
+    let consensus_channel = MemoryCommChannel::new(network.clone());
+    let da_channel = MemoryCommChannel::new(network.clone());
+    let view_sync_channel = MemoryCommChannel::new(network.clone());
+
+    let exchanges = <MockNodeImpl as NodeImplementation<MockTypes>>::Exchanges::create(
+        config.known_nodes_with_stake.clone(),
+        config.known_nodes.clone(),
+        (election_config.clone(), election_config.clone()),
+        (consensus_channel, view_sync_channel, da_channel),
+        pub_key,
+        pub_key.get_stake_table_entry(1u64),
+        priv_key.clone(),
+    );
+
+    SystemContext::init(
+        pub_key,
+        priv_key,
+        node_id as u64,
+        config,
+        MemoryStorage::empty(),
+        exchanges,
+        HotShotInitializer::from_genesis(MockBlock::genesis()).unwrap(),
+        data_source.populate_metrics(),
+    )
+    .await
+    .unwrap()
+    .0
 }

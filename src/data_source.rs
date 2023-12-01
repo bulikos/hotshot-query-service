@@ -25,7 +25,6 @@
 //! * [`ExtensibleDataSource`]
 //!
 
-mod buffered_channel;
 mod extension;
 mod fs;
 mod ledger_log;
@@ -44,7 +43,7 @@ pub use update::{UpdateDataSource, VersionedDataSource};
 #[espresso_macros::generic_tests]
 pub mod data_source_tests {
     use crate::{
-        availability::{BlockQueryData, LeafQueryData},
+        availability::{BlockQueryData, Fetch, LeafQueryData},
         status::MempoolQueryData,
         testing::{
             consensus::MockNetwork,
@@ -53,12 +52,12 @@ pub mod data_source_tests {
             },
             setup_test, sleep,
         },
-        Leaf, QueryError, QuorumCertificate,
+        Leaf, QuorumCertificate,
     };
     use async_std::sync::RwLock;
     use bincode::Options;
     use commit::Committable;
-    use futures::{StreamExt, TryStreamExt};
+    use futures::StreamExt;
     use hotshot_types::{
         data::{LeafType, ViewNumber},
         traits::{election::SignedCertificate, state::ConsensusTime, Block, State},
@@ -77,11 +76,12 @@ pub mod data_source_tests {
         let ds = ds.read().await;
         ds.get_leaf_range(..)
             .await
-            .unwrap()
-            .zip(ds.get_block_range(..).await.unwrap())
+            .zip(ds.get_block_range(..).await)
             .filter_map(|entry| async move {
                 match entry {
-                    (Ok(leaf), Ok(block)) if !block.is_empty() => Some((leaf, block)),
+                    (Fetch::Ready(leaf), Fetch::Ready(block)) if !block.is_empty() => {
+                        Some((leaf, block))
+                    }
                     _ => None,
                 }
             })
@@ -98,22 +98,22 @@ pub mod data_source_tests {
         // https://github.com/EspressoSystems/hotshot-query-service/issues/284
         let mut seen_blocks = HashMap::new();
         let mut seen_transactions = HashMap::new();
-        let mut leaves = ds.get_leaf_range(..).await.unwrap().enumerate();
+        let mut leaves = ds.get_leaf_range(..).await.enumerate();
         while let Some((i, leaf)) = leaves.next().await {
-            let leaf = leaf.unwrap();
+            let leaf = leaf.await;
             assert_eq!(leaf.height(), i as u64);
             assert_eq!(leaf.hash(), leaf.leaf().commit());
 
             // Check indices.
-            assert_eq!(leaf, ds.get_leaf(i).await.unwrap());
-            assert_eq!(leaf, ds.get_leaf(leaf.hash()).await.unwrap());
+            assert_eq!(leaf, ds.get_leaf(i).await.await);
+            assert_eq!(leaf, ds.get_leaf(leaf.hash()).await.await);
             assert!(ds
                 .get_proposals(&leaf.proposer(), None)
                 .await
                 .unwrap()
                 .contains(&leaf));
 
-            let Ok(block) = ds.get_block(i).await else {
+            let Ok(block) = ds.get_block(i).await.try_resolve() else {
                 continue;
             };
             assert_eq!(leaf.block_hash(), block.hash());
@@ -125,11 +125,11 @@ pub mod data_source_tests {
             );
 
             // Check indices.
-            assert_eq!(block, ds.get_block(i).await.unwrap());
+            assert_eq!(block, ds.get_block(i).await.await);
             // We should be able to look up the block by hash unless it is a duplicate. For
             // duplicate blocks, this function returns the index of the first duplicate.
             let ix = seen_blocks.entry(block.hash()).or_insert(i as u64);
-            assert_eq!(ds.get_block(block.hash()).await.unwrap().height(), *ix);
+            assert_eq!(ds.get_block(block.hash()).await.await.height(), *ix);
 
             for (j, txn) in block.block().iter().enumerate() {
                 // We should be able to look up the transaction by hash unless it is a duplicate.
@@ -138,7 +138,7 @@ pub mod data_source_tests {
                 let ix = seen_transactions
                     .entry(txn.commit())
                     .or_insert((i as u64, j));
-                let (block, pos) = ds.get_block_with_transaction(txn.commit()).await.unwrap();
+                let (block, pos) = ds.get_block_with_transaction(txn.commit()).await.await;
                 assert_eq!((block.height(), pos), *ix);
             }
         }
@@ -147,8 +147,7 @@ pub mod data_source_tests {
         for proposer in ds
             .get_leaf_range(..)
             .await
-            .unwrap()
-            .filter_map(|res| async move { res.ok().map(|leaf| leaf.proposer()) })
+            .then(|leaf| async move { leaf.await.proposer() })
             .collect::<HashSet<_>>()
             .await
         {
@@ -190,15 +189,7 @@ pub mod data_source_tests {
 
         // Submit a few blocks and make sure each one gets reflected in the query service and
         // preserves the consistency of the data and indices.
-        let mut blocks = {
-            ds.read()
-                .await
-                .subscribe_blocks(0)
-                .await
-                .unwrap()
-                .map(Result::unwrap)
-                .enumerate()
-        };
+        let mut blocks = { ds.read().await.subscribe_blocks(0).await.enumerate() };
         for nonce in 0..3 {
             let txn = MockTransaction { nonce };
             network.submit_transaction(txn).await;
@@ -213,7 +204,7 @@ pub mod data_source_tests {
                 tracing::info!("block {i} is empty");
             };
 
-            assert_eq!(ds.read().await.get_block(i).await.unwrap(), block);
+            assert_eq!(ds.read().await.get_block(i).await.await, block);
             validate(&ds).await;
         }
 
@@ -227,32 +218,28 @@ pub mod data_source_tests {
             assert_eq!(
                 ds.get_block_range(..)
                     .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap(),
+                    .then(Fetch::resolve)
+                    .collect::<Vec<_>>()
+                    .await,
                 storage
                     .get_block_range(..)
                     .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
+                    .then(Fetch::resolve)
+                    .collect::<Vec<_>>()
                     .await
-                    .unwrap()
             );
             assert_eq!(
                 ds.get_leaf_range(..)
                     .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .unwrap(),
+                    .then(Fetch::resolve)
+                    .collect::<Vec<_>>()
+                    .await,
                 storage
                     .get_leaf_range(..)
                     .await
-                    .unwrap()
-                    .try_collect::<Vec<_>>()
+                    .then(Fetch::resolve)
+                    .collect::<Vec<_>>()
                     .await
-                    .unwrap()
             );
         }
 
@@ -316,10 +303,10 @@ pub mod data_source_tests {
         }
 
         // Start consensus and wait for the transaction to be finalized.
-        let mut blocks = { ds.read().await.subscribe_blocks(0).await.unwrap() };
+        let mut blocks = { ds.read().await.subscribe_blocks(0).await };
         network.start().await;
         loop {
-            if !blocks.next().await.unwrap().unwrap().is_empty() {
+            if !blocks.next().await.unwrap().is_empty() {
                 break;
             }
         }
@@ -385,15 +372,15 @@ pub mod data_source_tests {
     async fn do_range_test<D, R, I>(ds: &D, range: R, expected_indices: I)
     where
         D: TestableDataSource,
-        R: RangeBounds<usize> + Clone + Send,
+        R: RangeBounds<usize> + Clone + Send + 'static,
         I: IntoIterator<Item = u64>,
     {
-        let mut leaves = ds.get_leaf_range(range.clone()).await.unwrap();
-        let mut blocks = ds.get_block_range(range).await.unwrap();
+        let mut leaves = ds.get_leaf_range(range.clone()).await;
+        let mut blocks = ds.get_block_range(range).await;
 
         for i in expected_indices {
-            let leaf = leaves.next().await.unwrap().unwrap();
-            let block = blocks.next().await.unwrap().unwrap();
+            let leaf = leaves.next().await.unwrap().await;
+            let block = blocks.next().await.unwrap().await;
             assert_eq!(leaf.height(), i);
             assert_eq!(block.height(), i);
         }
@@ -441,19 +428,13 @@ pub mod data_source_tests {
         ds.insert_block(block.clone()).await.unwrap();
 
         assert_eq!(ds.block_height().await.unwrap(), 1);
-        assert_eq!(leaf, ds.get_leaf(0).await.unwrap());
-        assert_eq!(block, ds.get_block(0).await.unwrap());
+        assert_eq!(leaf, ds.get_leaf(0).await.await);
+        assert_eq!(block, ds.get_block(0).await.await);
 
         // Revert the changes.
         ds.revert().await;
         assert_eq!(ds.block_height().await.unwrap(), 0);
-        assert!(matches!(
-            ds.get_leaf(0).await.unwrap_err(),
-            QueryError::NotFound
-        ));
-        assert!(matches!(
-            ds.get_block(0).await.unwrap_err(),
-            QueryError::NotFound
-        ));
+        assert!(matches!(ds.get_leaf(0).await, Fetch::Pending(_)));
+        assert!(matches!(ds.get_block(0).await, Fetch::Pending(_)));
     }
 }

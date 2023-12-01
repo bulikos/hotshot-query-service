@@ -167,7 +167,7 @@
 //! # use async_trait::async_trait;
 //! # use futures::FutureExt;
 //! # use hotshot_query_service::availability::{
-//! #   self, AvailabilityDataSource, QueryBlockSnafu, TransactionIndex,
+//! #   self, AvailabilityDataSource, FetchBlockSnafu, TransactionIndex,
 //! # };
 //! # use hotshot_query_service::testing::mocks::{
 //! #   MockNodeImpl as AppNodeImpl, MockTypes as AppTypes,
@@ -200,7 +200,7 @@
 //!         let block = state
 //!             .get_block(block_index)
 //!             .await
-//!             .context(QueryBlockSnafu { resource: block_index.to_string() })?;
+//!             .context(FetchBlockSnafu { resource: block_index.to_string() })?;
 //!         let txn = block.transaction(&txn_index).unwrap();
 //!         let utxo = // Application-specific logic to extract a UTXO from a transaction.
 //! #           todo!();
@@ -254,8 +254,8 @@
 //! # use hotshot_types::traits::signature_key::EncodedPublicKey;
 //! # use hotshot_query_service::QueryResult;
 //! # use hotshot_query_service::availability::{
-//! #   AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData, TransactionHash,
-//! #   TransactionIndex,
+//! #   AvailabilityDataSource, BlockId, BlockQueryData, Fetch, LeafId, LeafQueryData,
+//! #   TransactionHash, TransactionIndex,
 //! # };
 //! # use hotshot_query_service::metrics::PrometheusMetrics;
 //! # use hotshot_query_service::status::StatusDataSource;
@@ -276,19 +276,14 @@
 //! impl<D: AvailabilityDataSource<AppTypes, AppNodeImpl> + Send + Sync>
 //!     AvailabilityDataSource<AppTypes, AppNodeImpl> for AppState<D>
 //! {
-//!     type LeafRange<'a, R> = D::LeafRange<'a, R>
+//!     type LeafRange<R> = D::LeafRange<R>
 //!     where
-//!         Self: 'a,
 //!         R: RangeBounds<usize> + Send;
-//!     type BlockRange<'a, R> = D::BlockRange<'a, R>
+//!     type BlockRange<R> = D::BlockRange<R>
 //!     where
-//!         Self: 'a,
 //!         R: RangeBounds<usize> + Send;
 //!
-//!     type LeafStream = D::LeafStream;
-//!     type BlockStream = D::BlockStream;
-//!
-//!     async fn get_leaf<ID>(&self, id: ID) -> QueryResult<LeafQueryData<AppTypes, AppNodeImpl>>
+//!     async fn get_leaf<ID>(&self, id: ID) -> Fetch<LeafQueryData<AppTypes, AppNodeImpl>>
 //!     where
 //!         ID: Into<LeafId<AppTypes, AppNodeImpl>> + Send + Sync,
 //!     {
@@ -296,27 +291,37 @@
 //!     }
 //!
 //!     // etc
-//! #   async fn get_block<ID>(&self, id: ID) -> QueryResult<BlockQueryData<AppTypes>>
+//! #   async fn get_block<ID>(&self, id: ID) -> Fetch<BlockQueryData<AppTypes>>
 //! #   where
 //! #       ID: Into<BlockId<AppTypes>> + Send + Sync { todo!() }
-//! #   async fn get_block_with_transaction(&self, hash: TransactionHash<AppTypes>) -> QueryResult<(BlockQueryData<AppTypes>, TransactionIndex<AppTypes>)> { todo!() }
-//! #   async fn get_leaf_range<R>(&self, range: R) -> QueryResult<Self::LeafRange<'_, R>>
+//! #   async fn get_block_with_transaction(&self, hash: TransactionHash<AppTypes>) -> Fetch<(BlockQueryData<AppTypes>, TransactionIndex<AppTypes>)> { todo!() }
+//! #   async fn get_leaf_range<R>(&self, range: R) -> Self::LeafRange<R>
 //! #   where
 //! #       R: RangeBounds<usize> + Send { todo!() }
-//! #   async fn get_block_range<R>(&self, range: R) -> QueryResult<Self::BlockRange<'_, R>>
+//! #   async fn get_block_range<R>(&self, range: R) -> Self::BlockRange<R>
 //! #   where
 //! #       R: RangeBounds<usize> + Send { todo!() }
-//! #   async fn get_proposals(&self, id: &EncodedPublicKey, limit: Option<usize>) -> QueryResult<Vec<LeafQueryData<AppTypes, AppNodeImpl>>> { todo!() }
-//! #   async fn count_proposals(&self, id: &EncodedPublicKey) -> QueryResult<usize> { todo!() }
-//! #   async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> { todo!() }
-//! #   async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> { todo!() }
 //! }
 //!
 //! // Implement data source trait for status API by delegating to the underlying data source.
 //! #[async_trait]
-//! impl<D: StatusDataSource + Send + Sync> StatusDataSource for AppState<D> {
+//! impl<D: StatusDataSource<AppTypes, AppNodeImpl> + Send + Sync>
+//!     StatusDataSource<AppTypes, AppNodeImpl> for AppState<D>
+//! {
 //!     async fn block_height(&self) -> QueryResult<usize> {
 //!         self.hotshot_qs.block_height().await
+//!     }
+//!
+//!     async fn get_proposals(
+//!         &self,
+//!         id: &EncodedPublicKey,
+//!         limit: Option<usize>,
+//!     ) -> QueryResult<Vec<LeafQueryData<AppTypes, AppNodeImpl>>> {
+//!         self.hotshot_qs.get_proposals(id, limit).await
+//!     }
+//!
+//!     async fn count_proposals(&self, id: &EncodedPublicKey) -> QueryResult<usize> {
+//!         self.hotshot_qs.count_proposals(id).await
 //!     }
 //!
 //!     fn metrics(&self) -> &PrometheusMetrics {
@@ -433,7 +438,7 @@ where
     Deltas<Types, I>: Resolvable<Block<Types>>,
     Block<Types>: QueryableBlock,
     D: availability::AvailabilityDataSource<Types, I>
-        + status::StatusDataSource
+        + status::StatusDataSource<Types, I>
         + data_source::UpdateDataSource<Types, I>
         + data_source::VersionedDataSource
         + Send
@@ -479,7 +484,7 @@ mod test {
     use super::*;
     use crate::{
         availability::{
-            AvailabilityDataSource, BlockId, BlockQueryData, LeafId, LeafQueryData,
+            AvailabilityDataSource, BlockId, BlockQueryData, Fetch, LeafId, LeafQueryData,
             TransactionHash, TransactionIndex,
         },
         metrics::PrometheusMetrics,
@@ -512,58 +517,60 @@ mod test {
 
     #[async_trait]
     impl AvailabilityDataSource<MockTypes, MockNodeImpl> for CompositeState {
-        type LeafStream =
-            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::LeafStream;
-        type BlockStream =
-            <MockDataSource as AvailabilityDataSource<MockTypes, MockNodeImpl>>::BlockStream;
-
-        type LeafRange<'a, R> =
+        type LeafRange<R> =
             <MockDataSource as AvailabilityDataSource<
                 MockTypes,
                 MockNodeImpl,
-            >>::LeafRange<'a, R>
+            >>::LeafRange<R>
         where
-            Self: 'a,
             R: RangeBounds<usize> + Send;
-        type BlockRange<'a, R> =
+        type BlockRange<R> =
             <MockDataSource as AvailabilityDataSource<
                 MockTypes,
                 MockNodeImpl,
-            >>::BlockRange<'a, R>
+            >>::BlockRange<R>
         where
-            Self: 'a,
             R: RangeBounds<usize> + Send;
 
-        async fn get_leaf<ID>(&self, id: ID) -> QueryResult<LeafQueryData<MockTypes, MockNodeImpl>>
+        async fn get_leaf<ID>(&self, id: ID) -> Fetch<LeafQueryData<MockTypes, MockNodeImpl>>
         where
             ID: Into<LeafId<MockTypes, MockNodeImpl>> + Send + Sync,
         {
             self.hotshot_qs.get_leaf(id).await
         }
-        async fn get_block<ID>(&self, id: ID) -> QueryResult<BlockQueryData<MockTypes>>
+        async fn get_block<ID>(&self, id: ID) -> Fetch<BlockQueryData<MockTypes>>
         where
             ID: Into<BlockId<MockTypes>> + Send + Sync,
         {
             self.hotshot_qs.get_block(id).await
         }
-        async fn get_leaf_range<R>(&self, range: R) -> QueryResult<Self::LeafRange<'_, R>>
+        async fn get_leaf_range<R>(&self, range: R) -> Self::LeafRange<R>
         where
-            R: RangeBounds<usize> + Send,
+            R: RangeBounds<usize> + Send + 'static,
         {
             self.hotshot_qs.get_leaf_range(range).await
         }
-        async fn get_block_range<R>(&self, range: R) -> QueryResult<Self::BlockRange<'_, R>>
+        async fn get_block_range<R>(&self, range: R) -> Self::BlockRange<R>
         where
-            R: RangeBounds<usize> + Send,
+            R: RangeBounds<usize> + Send + 'static,
         {
             self.hotshot_qs.get_block_range(range).await
         }
         async fn get_block_with_transaction(
             &self,
             hash: TransactionHash<MockTypes>,
-        ) -> QueryResult<(BlockQueryData<MockTypes>, TransactionIndex<MockTypes>)> {
+        ) -> Fetch<(BlockQueryData<MockTypes>, TransactionIndex<MockTypes>)> {
             self.hotshot_qs.get_block_with_transaction(hash).await
         }
+    }
+
+    // Implement data source trait for status API.
+    #[async_trait]
+    impl StatusDataSource<MockTypes, MockNodeImpl> for CompositeState {
+        async fn block_height(&self) -> QueryResult<usize> {
+            self.hotshot_qs.block_height().await
+        }
+
         async fn get_proposals(
             &self,
             proposer: &EncodedPublicKey,
@@ -571,22 +578,9 @@ mod test {
         ) -> QueryResult<Vec<LeafQueryData<MockTypes, MockNodeImpl>>> {
             self.hotshot_qs.get_proposals(proposer, limit).await
         }
+
         async fn count_proposals(&self, proposer: &EncodedPublicKey) -> QueryResult<usize> {
             self.hotshot_qs.count_proposals(proposer).await
-        }
-        async fn subscribe_leaves(&self, height: usize) -> QueryResult<Self::LeafStream> {
-            self.hotshot_qs.subscribe_leaves(height).await
-        }
-        async fn subscribe_blocks(&self, height: usize) -> QueryResult<Self::BlockStream> {
-            self.hotshot_qs.subscribe_blocks(height).await
-        }
-    }
-
-    // Implement data source trait for status API.
-    #[async_trait]
-    impl StatusDataSource for CompositeState {
-        async fn block_height(&self) -> QueryResult<usize> {
-            self.hotshot_qs.block_height().await
         }
 
         fn metrics(&self) -> &PrometheusMetrics {

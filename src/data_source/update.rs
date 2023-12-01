@@ -36,7 +36,7 @@ use std::iter::once;
 /// * [update](Self::update), to update the query state when a new HotShot event is emitted
 #[async_trait]
 pub trait UpdateDataSource<Types: NodeType, I: NodeImplementation<Types>>:
-    UpdateAvailabilityData<Types, I> + UpdateStatusData
+    UpdateAvailabilityData<Types, I> + UpdateStatusData<Types, I>
 where
     Block<Types>: QueryableBlock,
 {
@@ -61,7 +61,7 @@ where
 impl<
         Types: NodeType,
         I: NodeImplementation<Types>,
-        T: UpdateAvailabilityData<Types, I> + UpdateStatusData + Send,
+        T: UpdateAvailabilityData<Types, I> + UpdateStatusData<Types, I> + Send,
     > UpdateDataSource<Types, I> for T
 where
     Block<Types>: QueryableBlock,

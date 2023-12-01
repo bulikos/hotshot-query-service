@@ -12,15 +12,31 @@
 
 use super::query_data::MempoolQueryData;
 use crate::{
+    availability::LeafQueryData,
     metrics::{MetricsError, PrometheusMetrics},
     QueryError, QueryResult,
 };
 use async_trait::async_trait;
-use hotshot_types::traits::metrics::Metrics;
+use hotshot_types::traits::{
+    metrics::Metrics,
+    node_implementation::{NodeImplementation, NodeType},
+    signature_key::EncodedPublicKey,
+};
 
 #[async_trait]
-pub trait StatusDataSource {
+pub trait StatusDataSource<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+{
     async fn block_height(&self) -> QueryResult<usize>;
+
+    async fn get_proposals(
+        &self,
+        proposer: &EncodedPublicKey,
+        limit: Option<usize>,
+    ) -> QueryResult<Vec<LeafQueryData<Types, I>>>;
+    async fn count_proposals(&self, proposer: &EncodedPublicKey) -> QueryResult<usize>;
 
     fn metrics(&self) -> &PrometheusMetrics;
 
@@ -61,11 +77,16 @@ pub trait StatusDataSource {
     }
 }
 
-pub trait UpdateStatusData {
+pub trait UpdateStatusData<Types, I> {
     fn populate_metrics(&self) -> Box<dyn Metrics>;
 }
 
-impl<T: StatusDataSource> UpdateStatusData for T {
+impl<Types, I, T> UpdateStatusData<Types, I> for T
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    T: StatusDataSource<Types, I>,
+{
     fn populate_metrics(&self) -> Box<dyn Metrics> {
         Box::new(self.metrics().clone())
     }

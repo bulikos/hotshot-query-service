@@ -353,7 +353,7 @@ impl NodeImplementation<MockTypes> for MockNodeImpl {
 #[async_trait]
 pub trait TestableDataSource:
     AvailabilityDataSource<MockTypes, MockNodeImpl>
-    + StatusDataSource
+    + StatusDataSource<MockTypes, MockNodeImpl>
     + UpdateDataSource<MockTypes, MockNodeImpl>
     + VersionedDataSource
     + Send

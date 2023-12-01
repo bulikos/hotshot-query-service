@@ -303,7 +303,7 @@ where
             hash: block.commit(),
             height: leaf_height(leaf),
             timestamp: round_timestamp(leaf.get_timestamp()),
-            size: bincode_opts().serialized_size(&block).unwrap_or_default(),
+            size: block_size::<Types>(&block),
             block,
         })
     }
@@ -402,6 +402,13 @@ where
     pub fn block_hash(&self) -> BlockHash<Types> {
         self.block_hash
     }
+}
+
+pub(crate) fn block_size<Types>(block: &Block<Types>) -> u64
+where
+    Types: NodeType,
+{
+    bincode_opts().serialized_size(block).unwrap_or_default()
 }
 
 fn parse_timestamp(ns: i128) -> Timestamp {

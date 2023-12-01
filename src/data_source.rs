@@ -63,7 +63,7 @@ pub struct DataSource<Storage, Fetcher> {
 #[espresso_macros::generic_tests]
 pub mod data_source_tests {
     use crate::{
-        availability::{BlockQueryData, Fetch, LeafQueryData},
+        availability::{block_size, BlockQueryData, Fetch, LeafQueryData},
         status::MempoolQueryData,
         testing::{
             consensus::MockNetwork,
@@ -139,10 +139,7 @@ pub mod data_source_tests {
             assert_eq!(leaf.block_hash(), block.hash());
             assert_eq!(block.height(), i as u64);
             assert_eq!(block.hash(), block.block().commit());
-            assert_eq!(
-                block.size(),
-                bincode_opts().serialized_size(block.block()).unwrap()
-            );
+            assert_eq!(block.size(), block_size::<MockTypes>(block.block()));
 
             // Check indices.
             assert_eq!(block, ds.get_block(i).await.await);

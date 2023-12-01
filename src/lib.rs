@@ -404,6 +404,7 @@ pub enum QueryError {
     Missing,
     /// There was an error while trying to fetch the requested resource.
     #[snafu(display("Failed to fetch requested resource: {message}"))]
+    #[snafu(context(suffix(QueryErrorSnafu)))]
     Error { message: String },
 }
 

@@ -23,6 +23,17 @@
 //! * [`ExtensibleDataSource`]
 //!
 
+use crate::{
+    availability::{AvailabilityDataSource, QueryableBlock},
+    Block,
+};
+use async_trait::async_trait;
+use derivative::Derivative;
+use fetcher::AvailabilityFetcher;
+use hotshot_types::traits::node_implementation::{NodeImplementation, NodeType};
+use std::fmt::Debug;
+use storage::AvailabilityStorage;
+
 mod extension;
 pub mod fetcher;
 mod fs;
@@ -52,10 +63,73 @@ pub use update::{UpdateDataSource, VersionedDataSource};
 /// available, and fills in everything else using the fetcher. Various kinds of data sources can be
 /// constructed out of [`DataSource`] by changing the storage and fetcher implementations used, and
 /// more complex data sources can be built on top using data source combinators.
-#[derive(Clone, Debug)]
+#[derive(Derivative)]
+#[derivative(
+    Clone(bound = "Storage: Clone"),
+    Debug(bound = "Storage: Debug, Fetcher: Debug")
+)]
 pub struct DataSource<Storage, Fetcher> {
     storage: Storage,
-    fetcher: Fetcher,
+    fetcher: Arc<Fetcher>,
+}
+
+impl<Storage, Fetcher> DataSource<Storage, Fetcher> {
+    pub fn new(storage: Storage, fetcher: Fetcher) -> Self {
+        Self {
+            storage,
+            fetcher: Arc::new(fetcher),
+        }
+    }
+}
+
+#[async_trait]
+impl<Types, I, Storage> AvailabilityDataSource<Types, I> for DataSource<Storage, Fetcher>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    Storage: AvailabilityStorage<Types, I>,
+    Fetcher: AvailabilityFetcher<Types, I>,
+{
+    type LeafRange<R> = FetchStream<Storage::LeafRange<R>, Fetcher>;
+    type BlockRange<R>: Stream<Item = Fetch<BlockQueryData<Types>>> + Unpin + Send + 'static
+    where
+        R: RangeBounds<usize> + Send;
+
+    async fn get_leaf<ID>(&self, id: ID) -> Fetch<LeafQueryData<Types, I>>
+    where
+        ID: Into<LeafId<Types, I>> + Send + Sync;
+    async fn get_block<ID>(&self, id: ID) -> Fetch<BlockQueryData<Types>>
+    where
+        ID: Into<BlockId<Types>> + Send + Sync;
+
+    async fn get_leaf_range<R>(&self, range: R) -> Self::LeafRange<R>
+    where
+        R: RangeBounds<usize> + Send + 'static;
+    async fn get_block_range<R>(&self, range: R) -> Self::BlockRange<R>
+    where
+        R: RangeBounds<usize> + Send + 'static;
+
+    /// Returns the block containing a transaction with the given `hash` and the transaction's
+    /// position in the block.
+    async fn get_block_with_transaction(
+        &self,
+        hash: TransactionHash<Types>,
+    ) -> Fetch<(BlockQueryData<Types>, TransactionIndex<Types>)>;
+
+    async fn subscribe_blocks(&self, from: usize) -> BoxStream<'static, BlockQueryData<Types>> {
+        self.get_block_range(from..)
+            .await
+            .then(Fetch::resolve)
+            .boxed()
+    }
+
+    async fn subscribe_leaves(&self, from: usize) -> BoxStream<'static, LeafQueryData<Types, I>> {
+        self.get_leaf_range(from..)
+            .await
+            .then(Fetch::resolve)
+            .boxed()
+    }
 }
 
 /// Generic tests we can instantiate for all the data sources.

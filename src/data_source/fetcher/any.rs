@@ -10,7 +10,43 @@
 // You should have received a copy of the GNU General Public License along with this program. If not,
 // see <https://www.gnu.org/licenses/>.
 
+use super::{BlockRequest, Fetchable, Fetcher, LeafRequest};
+use crate::{
+    availability::{BlockQueryData, LeafQueryData, QueryableBlock},
+    Block, Deltas, QueryError, QueryResult, Resolvable,
+};
+use async_std::sync::Arc;
+use async_trait::async_trait;
 use derivative::Derivative;
+use hotshot_types::traits::node_implementation::{NodeImplementation, NodeType};
+use std::fmt::Debug;
+
+/// Blanket trait combining [`Debug`] and [`Fetcher`].
+///
+/// This is necessary to create a fetcher trait object (`dyn Fetcher`, see [`BlockFetcher`] and
+/// [`LeafFetcher`]) which also implements [`Debug`], since trait objects can only have one non-auto
+/// trait bound.
+trait DebugFetcher<Types, I, T>: Fetcher<Types, I, T> + Debug
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    T: Fetchable<Types, I>,
+{
+}
+
+impl<Types, I, T, F> DebugFetcher<Types, I, T> for F
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    T: Fetchable<Types, I>,
+    F: Fetcher<Types, I, T> + Debug,
+{
+}
+
+type BlockFetcher<Types, I> = Arc<dyn DebugFetcher<Types, I, BlockQueryData<Types>>>;
+type LeafFetcher<Types, I> = Arc<dyn DebugFetcher<Types, I, LeafQueryData<Types, I>>>;
 
 /// Adaptor combining multiple data availability fetchers.
 ///
@@ -38,6 +74,7 @@ use derivative::Derivative;
 /// #   Types: NodeType,
 /// #   I: NodeImplementation<Types>,
 /// #   Block<Types>: QueryableBlock,
+/// #   Deltas<Types, I>: Resolvable<Block<Types>>,
 /// # {
 /// use hotshot_query_service::data_source::fetcher::{AnyFetcher, QueryServiceFetcher};
 ///
@@ -51,4 +88,108 @@ use derivative::Derivative;
 /// ```
 #[derive(Derivative)]
 #[derivative(Clone(bound = ""), Debug(bound = ""), Default(bound = ""))]
-pub struct AnyFetcher;
+pub struct AnyFetcher<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+{
+    block_fetchers: Vec<BlockFetcher<Types, I>>,
+    leaf_fetchers: Vec<LeafFetcher<Types, I>>,
+}
+
+#[async_trait]
+impl<Types, I> Fetcher<Types, I, BlockQueryData<Types>> for AnyFetcher<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+{
+    async fn fetch(&self, req: &BlockRequest<Types>) -> QueryResult<BlockQueryData<Types>> {
+        any_fetch(&self.block_fetchers, req).await
+    }
+}
+
+#[async_trait]
+impl<Types, I> Fetcher<Types, I, LeafQueryData<Types, I>> for AnyFetcher<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    Deltas<Types, I>: Resolvable<Block<Types>>,
+{
+    async fn fetch(&self, req: &LeafRequest) -> QueryResult<LeafQueryData<Types, I>> {
+        any_fetch(&self.leaf_fetchers, req).await
+    }
+}
+
+impl<Types, I> AnyFetcher<Types, I>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    Deltas<Types, I>: Resolvable<Block<Types>>,
+{
+    /// Add a sub-fetcher which fetches both blocks and leaves.
+    pub fn with_fetcher<F>(mut self, fetcher: F) -> Self
+    where
+        F: Fetcher<Types, I, BlockQueryData<Types>>
+            + Fetcher<Types, I, LeafQueryData<Types, I>>
+            + Debug,
+    {
+        let fetcher = Arc::new(fetcher);
+        self.block_fetchers.push(fetcher.clone());
+        self.leaf_fetchers.push(fetcher);
+        self
+    }
+
+    /// Add a sub-fetcher which fetches blocks.
+    pub fn with_block_fetcher<F>(mut self, fetcher: F) -> Self
+    where
+        F: Fetcher<Types, I, BlockQueryData<Types>> + Debug,
+    {
+        self.block_fetchers.push(Arc::new(fetcher));
+        self
+    }
+
+    /// Add a sub-fetcher which fetches leaves.
+    pub fn with_leaf_fetcher<F>(mut self, fetcher: F) -> Self
+    where
+        F: Fetcher<Types, I, LeafQueryData<Types, I>> + Debug,
+    {
+        self.leaf_fetchers.push(Arc::new(fetcher));
+        self
+    }
+}
+
+async fn any_fetch<Types, I, F, T>(fetchers: &[Arc<F>], req: &T::Request) -> QueryResult<T>
+where
+    Types: NodeType,
+    I: NodeImplementation<Types>,
+    Block<Types>: QueryableBlock,
+    T: Fetchable<Types, I>,
+    F: Fetcher<Types, I, T> + ?Sized,
+{
+    // There's a policy question of how to decide when to try each fetcher: all in parallel, in
+    // serial, or a combination. For now, we do the simplest thing of trying each in order, in
+    // serial. This has the best performance in the common case when we succeed on the first
+    // fetcher: low latency, and no undue burden on the other fetchers. However, a more complicated
+    // strategy where we slowly ramp up the parallelism as more and more requests fail may provide
+    // better worst-case latency.
+    for (i, f) in fetchers.iter().enumerate() {
+        match f.fetch(req).await {
+            Ok(obj) => return Ok(obj),
+            Err(err) => {
+                tracing::warn!(
+                    "error fetching request {req:?} from fetcher {i}/{}: {err}",
+                    fetchers.len()
+                );
+                continue;
+            }
+        }
+    }
+
+    // If all fetchers failed, we already logged the specific errors from each one. It suffices to
+    // just return a generic error.
+    Err(QueryError::NotFound)
+}

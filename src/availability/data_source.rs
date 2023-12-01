@@ -61,9 +61,9 @@ pub type LeafId<Types, I> = ResourceId<Leaf<Types, I>>;
 ///
 /// This interface provides expressive queries over all the data which is made available by HotShot
 /// consensus. The data exposed by this interface consists entirely of _normative_ data: data which
-/// every HotShot node or light client will agree on, and which is guaranteed by consensus to be
-/// immutable. This immutability has an interesting consequence: all of the methods exposed by this
-/// trait are _pure_: given equivalent inputs, the same method will always return equivalent
+/// every correct HotShot node or light client will agree on, and which is guaranteed by consensus
+/// to be immutable. This immutability has an interesting consequence: all of the methods exposed by
+/// this trait are _pure_: given equivalent inputs, the same method will always return equivalent
 /// outputs[^1].
 ///
 /// This purity property has a further consequence: none of the methods defined here can fail! Even

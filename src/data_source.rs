@@ -12,23 +12,23 @@
 
 //! Persistent storage and sources of data consumed by APIs.
 //!
-//! Naturally, an archival query service such as this is heavily dependent on a persistent storage
-//! implementation. The APIs provided by this query service are generic over the specific type of
-//! the persistence layer, which we call a _data source_. This module provides the following
-//! concrete persistence implementations:
+//! The APIs provided by this query service are generic over the implementation which actually
+//! retrieves data in answer to queries. We call this implementation a _data source_. This module
+//! defines a data source and provides several pre-built implementations:
 //! * [`FileSystemDataSource`]
 //! * [`SqlDataSource`]
-//!
-//! The user can choose which data source to use when initializing the query service.
+//! * [`DataSource`], a generalization of the above
 //!
 //! We also provide combinators for modularly adding functionality to existing data sources:
 //! * [`ExtensibleDataSource`]
 //!
 
 mod extension;
+pub mod fetcher;
 mod fs;
 mod ledger_log;
 pub mod sql;
+pub mod storage;
 mod update;
 
 pub use extension::ExtensibleDataSource;
@@ -37,6 +37,26 @@ pub use fs::FileSystemDataSource;
 #[cfg(feature = "sql-data-source")]
 pub use sql::SqlDataSource;
 pub use update::{UpdateDataSource, VersionedDataSource};
+
+/// The most basic kind of data source.
+///
+/// A data source is constructed modularly by combining a [storage] implementation with a [fetcher].
+/// The former allows the query service to store the data it has persistently in an easily
+/// accessible storage medium, such as the local file system or a database. This allows it to answer
+/// queries efficiently and to maintain its state across restarts. The latter allows the query
+/// service to fetch data that is missing from its storage from an external data availability
+/// provider, such as the Tiramisu DA network or another instance of the query service.
+///
+/// These two components of a data source are combined in [`DataSource`], which is the lowest level
+/// kind of data source available. It simply uses the storage implementation to fetch data when
+/// available, and fills in everything else using the fetcher. Various kinds of data sources can be
+/// constructed out of [`DataSource`] by changing the storage and fetcher implementations used, and
+/// more complex data sources can be built on top using data source combinators.
+#[derive(Clone, Debug)]
+pub struct DataSource<Storage, Fetcher> {
+    storage: Storage,
+    fetcher: Fetcher,
+}
 
 /// Generic tests we can instantiate for all the data sources.
 #[cfg(any(test, feature = "testing"))]
